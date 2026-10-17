@@ -1,0 +1,112 @@
+/* clippr-gui styles. Colors come from libadwaita variables so light, dark and accent
+   preferences all apply. */
+
+/* Status dot */
+.status-dot {
+  min-width: 10px;
+  min-height: 10px;
+  border-radius: 999px;
+  background-color: alpha(currentColor, 0.3);
+}
+.status-dot.rec {
+  background-color: var(--destructive-bg-color);
+  box-shadow: 0 0 0 3px alpha(var(--destructive-bg-color), 0.25);
+}
+.status-dot.starting {
+  background-color: var(--warning-bg-color);
+}
+.status-dot.error {
+  background-color: var(--error-bg-color);
+}
+
+.status-strip {
+  padding: 10px 12px 10px 16px;
+  border-radius: 12px;
+  background-color: var(--card-bg-color);
+  box-shadow: 0 0 0 1px var(--card-shade-color);
+}
+
+button.pill-small {
+  border-radius: 999px;
+  padding: 4px 14px;
+}
+
+/* Clip grid */
+gridview.clip-grid {
+  background: none;
+  padding: 6px 12px 18px 12px;
+}
+gridview.clip-grid > child {
+  padding: 6px;
+  border-radius: 14px;
+  background: none;
+}
+gridview.clip-grid > child:hover .thumb {
+  box-shadow: 0 0 0 2px var(--accent-color);
+}
+gridview.clip-grid > child:focus-visible .thumb {
+  box-shadow: 0 0 0 3px var(--accent-color);
+}
+
+.clip-card .thumb {
+  border-radius: 10px;
+  background-color: alpha(currentColor, 0.08);
+  transition: box-shadow 120ms ease-out;
+}
+.clip-card .clip-title {
+  font-weight: 600;
+}
+.duration-badge {
+  margin: 6px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-size: 0.8em;
+  font-weight: 700;
+  font-feature-settings: "tnum";
+  color: white;
+  background-color: rgba(0, 0, 0, 0.7);
+}
+.fav-badge {
+  margin: 6px;
+  padding: 3px;
+  border-radius: 999px;
+  color: #f6d32d;
+  background-color: rgba(0, 0, 0, 0.55);
+  -gtk-icon-size: 12px;
+}
+
+/* Editor */
+.video-frame {
+  border-radius: 12px;
+  background-color: black;
+}
+.play-button {
+  min-width: 38px;
+  min-height: 38px;
+}
+.timeline {
+  border-radius: 10px;
+}
+.timeline:focus-visible {
+  outline: 2px solid alpha(var(--accent-color), 0.6);
+  outline-offset: 2px;
+}
+.editor-sidebar {
+  border-left: 1px solid var(--border-color);
+}
+
+/* Overlay */
+window.clippr-overlay {
+  border-radius: 16px;
+}
+button.clip-button {
+  min-height: 46px;
+  border-radius: 12px;
+  font-weight: 700;
+  font-size: 1.05em;
+}
+.saved-card {
+  padding: 10px;
+  border-radius: 10px;
+  background-color: alpha(var(--success-bg-color), 0.12);
+}

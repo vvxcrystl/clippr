@@ -11,3 +11,7 @@ path = "src/main.rs"
 [dependencies]
 clippr-core.workspace = true
 anyhow.workspace = true
+gtk = { version = "0.11.5", package = "gtk4", features = ["v4_20"] }
+adw = { version = "0.9.2", package = "libadwaita", features = ["v1_8"] }
+async-channel = "2"
+chrono.workspace = true

@@ -2,11 +2,11 @@
 //!
 //! Every field has a default, so a partial or missing file loads cleanly.
 
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub general: General,
@@ -120,17 +120,6 @@ pub struct Hotkeys {
     pub toggle_overlay: String,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            general: General::default(),
-            video: Video::default(),
-            audio: Audio::default(),
-            hotkeys: Hotkeys::default(),
-        }
-    }
-}
-
 impl Default for General {
     fn default() -> Self {
         Self {
@@ -159,7 +148,12 @@ impl Default for Video {
 
 impl Default for Audio {
     fn default() -> Self {
-        Self { capture_desktop: true, capture_mic: false, mic_device: None, bitrate_kbps: 160 }
+        Self {
+            capture_desktop: true,
+            capture_mic: false,
+            mic_device: None,
+            bitrate_kbps: 160,
+        }
     }
 }
 
@@ -186,11 +180,19 @@ impl Config {
 
     /// Write atomically (temp file + rename) to [`crate::paths::config_file`].
     pub fn save(&self) -> anyhow::Result<()> {
-        let path = crate::paths::config_file();
-        std::fs::create_dir_all(crate::paths::config_dir())?;
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, toml::to_string_pretty(self)?)?;
-        std::fs::rename(tmp, path)?;
+        self.save_to(&crate::paths::config_file())
+    }
+
+    fn save_to(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let dir = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("config has no parent"))?;
+        std::fs::create_dir_all(dir)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        tmp.write_all(toml::to_string_pretty(self)?.as_bytes())?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(path)?;
+        std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     }
 
@@ -214,5 +216,35 @@ impl Config {
             crate::config::Codec::H264 => scaled,
             _ => scaled * 7 / 10,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_saves_use_independent_temp_files() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let path = &path;
+                    scope.spawn(move || {
+                        let mut config = Config::default();
+                        config.hotkeys.clip_short = format!("F{i}");
+                        config.save_to(path)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+        let config: Config = toml::from_str(&std::fs::read_to_string(path)?)?;
+        assert!(config.hotkeys.clip_short.starts_with('F'));
+        assert_eq!(std::fs::read_dir(dir.path())?.count(), 1);
+        Ok(())
     }
 }

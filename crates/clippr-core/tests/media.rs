@@ -114,6 +114,16 @@ fn media_library_and_exports() -> anyhow::Result<()> {
     assert_eq!(listed.len(), 2);
     assert_eq!(listed[0].id, "corrupt");
     assert!(lib.get("corrupt").is_ok());
+    // Oversized sidecars are corrupt metadata: reject directly and regenerate from video.
+    let sidecar = clips.join("source.json");
+    let mut oversized = serde_json::to_vec(&clip)?;
+    oversized.resize(1024 * 1024 + 1, b' ');
+    std::fs::write(&sidecar, oversized)?;
+    assert!(lib.get("source").unwrap_err().to_string().contains("1 MiB"));
+    assert_eq!(lib.list()?.len(), 2);
+    assert!(std::fs::metadata(&sidecar)?.len() < 1024 * 1024);
+    assert!(lib.get("source").is_ok());
+    lib.update(&clip)?;
     let keep = vec![
         Segment {
             start_secs: 0.0,

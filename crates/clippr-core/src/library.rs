@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -91,11 +91,17 @@ impl Library {
     pub fn get(&self, id: &str) -> anyhow::Result<ClipMeta> {
         ensure!(is_valid_id(id), "invalid clip id");
         let path = self.dir.join(format!("{id}.json"));
-        ensure!(
-            !fs::symlink_metadata(&path)?.file_type().is_symlink(),
-            "sidecar is a symlink"
-        );
-        let clip: ClipMeta = serde_json::from_slice(&fs::read(path)?)?;
+        const MAX_SIDECAR: u64 = 1024 * 1024;
+        let meta = fs::symlink_metadata(&path)?;
+        ensure!(meta.is_file(), "sidecar is not a regular file");
+        ensure!(meta.len() <= MAX_SIDECAR, "sidecar exceeds 1 MiB");
+        // Also bound the read if the file grows after the metadata check.
+        let mut bytes = Vec::new();
+        fs::File::open(path)?
+            .take(MAX_SIDECAR + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(bytes.len() as u64 <= MAX_SIDECAR, "sidecar exceeds 1 MiB");
+        let clip: ClipMeta = serde_json::from_slice(&bytes)?;
         ensure!(clip.id == id, "sidecar id mismatch");
         self.checked_video_path(&clip)?;
         Ok(clip)

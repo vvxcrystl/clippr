@@ -118,7 +118,8 @@ impl Ring {
         let Some(index) = self
             .video
             .iter()
-            .position(|p| p.keyframe && p.pts >= cutoff)
+            .rposition(|p| p.keyframe && p.pts <= cutoff)
+            .or_else(|| self.video.iter().position(|p| p.keyframe))
         else {
             bail!("waiting for the next video keyframe");
         };
@@ -200,5 +201,30 @@ mod tests {
         ring.clear();
         assert_eq!(snap.video.len(), 6);
         assert_eq!(ring.bytes, 0);
+    }
+
+    #[test]
+    fn snapshot_includes_requested_duration_or_all_available_history() {
+        gst::init().unwrap();
+        let caps = gst::Caps::new_empty_simple("video/x-h264");
+        let mut ring = Ring::new(12);
+        for frame in 0..21 {
+            ring.push(packet(frame, frame % 2 == 0), &caps, true);
+        }
+        // The requested start (8.5 s) falls between keyframes at 8 and 9 s.
+        let snap = ring.snapshot(2).unwrap();
+        assert_eq!(snap.start, 8_000_000_000);
+        assert_eq!(snap.end, 10_500_000_000);
+        assert!(snap.end - snap.start >= 2_000_000_000);
+        assert!(snap.video[0].keyframe);
+
+        // An exact keyframe boundary must not include the preceding GOP.
+        ring.push(packet(21, false), &caps, true);
+        assert_eq!(ring.snapshot(2).unwrap().start, 9_000_000_000);
+
+        // After trimming, an oversized request still saves the oldest available GOP.
+        ring.limit_ns = 4_000_000_000;
+        ring.trim();
+        assert_eq!(ring.snapshot(20).unwrap().start, ring.video[0].pts);
     }
 }

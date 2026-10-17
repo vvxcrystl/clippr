@@ -89,7 +89,7 @@ with tempfile.TemporaryDirectory(prefix='clipprd-smoke-') as tmp:
             video = next(s for s in probe['streams'] if s['codec_type'] == 'video')
             assert video['codec_name'] == codec, probe
             assert video.get('has_b_frames', 0) == 0, probe
-            assert seconds - 1.2 <= float(probe['format']['duration']) <= seconds + .1, probe
+            assert seconds <= float(video['duration']) <= seconds + 1.1, probe
             packets = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v', '-show_packets', '-show_entries', 'packet=pts_time,flags', '-of', 'json', str(path)]))['packets']
             assert 'K' in packets[0]['flags'] and float(packets[0]['pts_time']) == 0, packets[0]
             keys = [float(p['pts_time']) for p in packets if 'K' in p['flags']]

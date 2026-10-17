@@ -54,8 +54,10 @@ No timer publishes status and no loop polls the desktop, keyboard, child process
 or capture bus. On a quiet desktop PipeWire can deliver fewer frames than the
 configured maximum. Keyframes are requested from incoming timestamps as well as
 from the encoder GOP limit, preserving one-second seek points at variable rates.
-A saved clip begins at the first available keyframe at or after the requested
-start, so it can be up to about one second shorter than requested.
+A saved clip begins at the last available keyframe at or before the requested
+start, using the ring's two seconds of slack. It includes at least the requested
+duration whenever that much history is available; otherwise it saves all available
+history from the oldest keyframe.
 
 ## Verification
 

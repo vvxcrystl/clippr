@@ -53,8 +53,9 @@ editor export (`edit.rs`) and IPC client (`client.rs`).
    `General::buffer_secs()` of video. Trimming keeps the oldest retained video sample a
    keyframe. Keep codec headers (caps / codec_data) alongside.
 5. **Saving.** On save, take a cheap snapshot of the deques under a short lock, then mux on a
-   background thread at low priority (`SCHED_IDLE` or nice 19): start at the first video
-   keyframe at or after `now - seconds`, align audio by PTS, rebase timestamps to zero,
+   background thread at low priority (`SCHED_IDLE` or nice 19): start at the last video
+   keyframe at or before `now - seconds` (or the oldest keyframe if history is shorter),
+   align audio by PTS, rebase timestamps to zero,
    write `appsrc → mp4mux (faststart) → filesink` to `<clips_dir>/<id>.mp4.part`, then rename.
    Write the sidecar `<id>.json` ([`ClipMeta`]) atomically after the video. Then emit
    `Event::ClipSaved` and, if enabled, a desktop notification (org.freedesktop.Notifications

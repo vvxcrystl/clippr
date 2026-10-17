@@ -4,6 +4,263 @@ Machine: KDE Plasma 6 Wayland, AMD RX 9060 XT, Mesa radeonsi VAAPI,
 GStreamer 1.28.8, Rust 1.97. All Cargo commands used
 `CARGO_TARGET_DIR=target/daemon`.
 
+## Encoder size/quality investigation — 2026-10-16
+
+The original files were read only and copied to `/tmp`. Geometry Dash 1/2 are
+actually **1080p60**, with 1,804/1,813 frames over 30.067/30.217s; the browser
+sample is variable rate (151 frames over 3.017s, nominal 120fps). No experiment
+changes dimensions or drops source frames. A separate 1080p120 `testsrc2` source
+covers motion/detail. Its eight-second lossless sequence was repeated by stream
+copy to make a 30-second stress reference, including the loop transitions.
+
+Each real source was decoded once to lossless `libx264 -preset ultrafast -qp 0`
+Matroska and every candidate was compared with that reference. This measures
+additional compression damage, not recovery of detail lost in the original.
+GStreamer results use software decode of that reference, `vapostproc`, and the
+same VA encoder/parser/caps as capture. These offline system-memory uploads are
+benchmark inputs, not a change to the daemon's DMA-BUF path.
+
+Metrics use the default libvmaf model, `n_threads=8:n_subsample=12`, plus standard
+SSIM on every twelfth frame. Both inputs have identical frame-index timing for
+scoring (avoiding Matroska millisecond rounding) and explicit BT.709 limited-range
+metadata to prevent automatic color-matrix conversions in the filter graph.
+Output files retain their source timing. `p01` is the nearest-rank first percentile of sampled frame VMAF
+(the ceil(0.01 * N)th sorted sample), **not** the average of the worst one percent.
+Raw results also retain the minimum.
+The short browser source has only 13 metric samples, so its p01 is effectively
+the minimum. SSIM is the pooled `All` score on those sampled frames.
+
+Sizes below are decimal MB of MP4 video normalized to 30s, plus **0.60 MB** for
+unchanged AAC 160kbps. Browser sizes are extrapolations of its three seconds,
+not predictions of future desktop activity. Each old/new row uses the same
+source codec: old CBR uses the previous fixed table, 1s GOP and target-usage 4;
+new VBR uses a quantizer floor, 2s GOP, target-usage 1, target-percentage 100,
+and a two-second CPB. The new 120fps budget is twice the 60fps budget.
+
+Actual MP4s made by stream-copying the original AAC into the new H.264 videos:
+**37,828,936 → 16,671,529 bytes (55.93% smaller)** for Geometry Dash 1, and
+**38,261,617 → 17,032,006 bytes (55.49% smaller)** for Geometry Dash 2.
+Against the controlled CBR re-encodes, mean VMAF changes by -0.288/-0.287.
+These are offline A/B encodes of the supplied footage, not a second live game run.
+
+### Geometry Dash 1 (30.067s, 60fps)
+
+| Codec / settings | MB / 30s | VMAF mean | VMAF p01 | SSIM |
+|---|---:|---:|---:|---:|
+| H264 old CBR, 1s GOP, usage4 | 36.98 | 97.572 | 96.309 | 0.997740 |
+| H264 new VBR, minQP20, 2s GOP, usage1 | 16.61 | 97.284 | 95.874 | 0.997253 |
+| HEVC old CBR, 1s GOP, usage4 | 26.13 | 97.595 | 96.237 | 0.997854 |
+| HEVC new VBR, minQP20, 2s GOP, usage1 | 13.85 | 97.231 | 96.257 | 0.996961 |
+| AV1 old CBR, 1s GOP, usage4 | 26.12 | 97.557 | 95.120 | 0.997319 |
+| AV1 new VBR, minQP60, 2s GOP, usage1 | 11.02 | 97.026 | 95.683 | 0.995686 |
+
+### Geometry Dash 2 (30.217s, 60fps)
+
+| Codec / settings | MB / 30s | VMAF mean | VMAF p01 | SSIM |
+|---|---:|---:|---:|---:|
+| H264 old CBR, 1s GOP, usage4 | 36.88 | 97.651 | 96.529 | 0.997768 |
+| H264 new VBR, minQP20, 2s GOP, usage1 | 16.88 | 97.364 | 96.272 | 0.997136 |
+| HEVC old CBR, 1s GOP, usage4 | 26.08 | 97.624 | 96.212 | 0.997759 |
+| HEVC new VBR, minQP20, 2s GOP, usage1 | 14.27 | 97.273 | 95.940 | 0.996916 |
+| AV1 old CBR, 1s GOP, usage4 | 26.03 | 97.604 | 96.503 | 0.997270 |
+| AV1 new VBR, minQP60, 2s GOP, usage1 | 11.12 | 97.070 | 95.041 | 0.995548 |
+
+### Browser (3.017s, variable rate)
+
+| Codec / settings | MB / 30s | VMAF mean | VMAF p01 | SSIM |
+|---|---:|---:|---:|---:|
+| H264 old CBR, 1s GOP, usage4 | 19.79 | 96.460 | 95.544 | 0.996724 |
+| H264 new VBR, minQP20, 2s GOP, usage1 | 4.95 | 95.447 | 95.062 | 0.993467 |
+| HEVC old CBR, 1s GOP, usage4 | 15.05 | 96.439 | 93.818 | 0.995749 |
+| HEVC new VBR, minQP20, 2s GOP, usage1 | 5.57 | 96.189 | 95.971 | 0.994602 |
+| AV1 old CBR, 1s GOP, usage4 | 13.83 | 95.690 | 89.162 | 0.993976 |
+| AV1 new VBR, minQP60, 2s GOP, usage1 | 4.36 | 94.922 | 91.611 | 0.990994 |
+
+### High-motion testsrc2 loop (30s, 120fps)
+
+| Codec / settings | MB / 30s | VMAF mean | VMAF p01 | SSIM |
+|---|---:|---:|---:|---:|
+| H264 old CBR, 1s GOP, usage4 | 37.27 | 88.855 | 85.114 | 0.980639 |
+| H264 new VBR, minQP20, 2s GOP, usage1 | 87.27 | 94.468 | 93.061 | 0.994844 |
+| HEVC old CBR, 1s GOP, usage4 | 26.15 | 90.773 | 87.393 | 0.985318 |
+| HEVC new VBR, minQP20, 2s GOP, usage1 | 72.56 | 93.698 | 92.052 | 0.993527 |
+| AV1 old CBR, 1s GOP, usage4 | 26.32 | 89.936 | 87.214 | 0.978493 |
+| AV1 new VBR, minQP60, 2s GOP, usage1 | 82.50 | 94.144 | 92.990 | 0.992716 |
+
+### What shipped and why
+
+- H.264 remains the default. All three VA encoders use VBR with `min-qp` rather
+  than spending their entire budget on flat content. H.264/HEVC QP floors are
+  Low 26 / Medium 20 / High 16; AV1 index floors are 100 / 60 / 40.
+  The shared `Video::quality_quantizer()` supplies those values.
+- The 60fps bitrate table is unchanged, with linear scaling by configured fps
+  and the existing quality/codec multipliers. 1080p Medium H.264 budgets at
+  30/60/120/144fps are 5/10/20/24 Mbps. Custom is still the unscaled user bitrate
+  and keeps the previous bitrate/default-rate-control mode. No serialized config
+  field was added, renamed or removed.
+- `Config::video_bitrate_kbps(height)` has the same signature. It now accounts
+  for fps and supplies a nominal VBR budget, also used by the GUI's existing RAM
+  estimate. **It is not a hard bound**: on the 30s stress source the driver
+  overshoots 20 Mbps H.264 to 23.11 Mbps, and 14 Mbps HEVC/AV1 to 19.19/21.84 Mbps.
+  Settings can therefore underestimate memory for difficult content. No GUI code
+  was edited. The fps-aware budget also deliberately makes high-detail 120fps
+  clips larger and higher fidelity than the old fps-independent table; see the
+  complete stress-source rows instead of assuming universal size savings.
+- `KEYFRAME_INTERVAL_SECS=2` controls encoder GOP length and timestamp-driven
+  force-key-unit requests. `General::buffer_secs()` adds three seconds instead
+  of two (one complete GOP plus one second of stream skew). Trimming remains
+  bounded and starts at a keyframe. A test checks the longest requested clip
+  at every phase of repeated two-second GOPs, including after trimming.
+- H.264 B-frames work on this GPU (the test output has reordered PTS/DTS), but
+  the ring treats decreasing PTS as discontinuity and saving explicitly writes
+  DTS=PTS. They stay disabled. HEVC advertises no backward references. AV1 uses
+  `hierarchical-level=1` to avoid implicit future-reference reordering as well.
+- Software H.264 keeps `superfast`/`zerolatency` and no B-frames, but presets now
+  use capped CRF (`pass=qual`, quantizer 26/20/16, bitrate/VBV budget). No slower
+  software preset was introduced. Audio encoding is unchanged.
+- Precise editor exports preserve the source codec on VAAPI, using the shared
+  Medium VBR/QP/GOP model and passthrough frame timing. Failure still falls back
+  to H.264 `libx264 -preset veryfast -crf 20`, now with the shared bitrate/VBV
+  budget. A full real-source export check confirmed 1920x1080, all 1,804 frames,
+  60fps and the original codec for H.264, HEVC and AV1. Re-encoding is lossy:
+  compared with captured candidates, the additional mean VMAF loss is
+  0.384 / 0.486 / 0.809 points. The AV1 first-percentile loss is 1.808 points
+  (minimum loss 2.870 points); it is the weakest result, rather than a claim
+  of lossless editing.
+
+### Full Geometry Dash 1 precise exports
+
+Compared against the same original lossless reference, after capturing with the
+new settings and then re-encoding the complete captured video once more:
+
+| Codec | MB / 30s | VMAF mean | VMAF p01 | VMAF min | SSIM |
+|---|---:|---:|---:|---:|---:|
+| H264 | 16.07 | 96.900 | 94.278 | 94.246 | 0.996259 |
+| HEVC | 13.90 | 96.745 | 95.456 | 94.878 | 0.996078 |
+| AV1 | 10.44 | 96.217 | 93.875 | 90.304 | 0.994638 |
+
+### Adapter capabilities and alternatives measured
+
+`vainfo -a` and the installed GStreamer 1.28.8 property enums expose CBR, VBR,
+CQP and QVBR for all three codecs. ICQ is absent. `bitrate`, `cpb-size`,
+`target-percentage`, QP bounds and target-usage are available; there is no separate
+GStreamer max-bitrate property. Maximum VBR bitrate is derived from bitrate and
+target-percentage. Drivers without VBR keep their default mode with a warning.
+
+Full raw candidate results, including CBR/VBR/CQP/QVBR and codec/quality sweeps,
+are in [tests/quality-results.json](tests/quality-results.json). Prototypes use
+FFmpeg `h264_vaapi`, `hevc_vaapi` and `av1_vaapi`; the shipped candidates were
+also encoded with GStreamer rather than assuming those adapters are identical.
+
+CQP did well on easy material but has no bitrate control: H.264 QP22 used
+12.03 MB/30s on the first eight seconds of Geometry Dash, but 172.82 MB/30s
+on the eight-second stress source. QVBR also overspent on hard content. For
+example, full Geometry Dash H.264 QVBR20 used 21.48 MB/30s versus VBR-floor20's
+16.61 MB/30s, at essentially the same mean VMAF (97.526 versus 97.284).
+The VBR floor was the better size/fidelity compromise.
+
+For the eight-second Geometry Dash prototype, QVBR22/usage1/10Mbps with
+1/2/3s GOPs used 18.96/16.39/15.69 MB per 30s at mean VMAF
+97.177/97.082/97.034. Two seconds captures most of the gain; a third second
+saves only another 4.3% while making seeks and history slack worse. On the
+120fps stress prototype, 1/2/3s GOPs saved only 91.40/90.64/90.15 MB per 30s.
+
+At QVBR22/20Mbps, H.264 B2 increased Geometry Dash size from 20.08 to
+24.03 MB/30s, while reducing stress-source size only from 89.66 to 87.99 MB/30s.
+That does not justify redesigning the ring/mux timestamp model in this change.
+Usage1 reduced the same flat-content prototype from 20.08 to 15.07 MB/30s
+at slightly higher mean VMAF; usage4 and usage7 produced identical outputs.
+
+On the full Geometry Dash 1 source the shipped codecs are approximately
+quality matched: H.264/HEVC/AV1 mean VMAF 97.284/97.231/97.026 at
+16.61/13.85/11.02 MB/30s. AV1 is another 34% smaller than the new H.264 here.
+It is only 5.5% smaller on the 30s stress source at similar mean quality;
+HEVC is the smaller alternative on that source. AV1 is not universally best
+on this hardware and these settings.
+
+### Reproducing an individual comparison
+
+Use only copied clips and isolated output paths. Do not run parallel hardware
+benchmarks while gaming or assessing live capture: they compete for the same
+GPU. For a 60fps H.264 Medium candidate, the encoder properties are:
+
+```text
+filesrc location=reference.mkv ! matroskademux ! h264parse !
+avdec_h264 max-threads=4 ! vapostproc !
+video/x-raw(memory:VAMemory),format=NV12 !
+vah264enc rate-control=vbr min-qp=20 bitrate=10000
+ target-percentage=100 cpb-size=20000 target-usage=1
+ key-int-max=120 b-frames=0 ! h264parse config-interval=-1 !
+video/x-h264,stream-format=avc,alignment=au ! mp4mux ! filesink location=candidate.mp4
+```
+
+In FFmpeg the analogous prototype uses `-rc_mode VBR -qmin 20 -quality 1
+-b:v 10M -maxrate 10M -bufsize 20M -g 120 -bf 0`. Decode candidate/reference
+with bounded threads; set identical BT.709 limited-range metadata and
+`setpts=N/(60*TB)` on each branch, then score with
+`libvmaf=n_threads=8:n_subsample=12:shortest=1:log_fmt=json:log_path=metrics.json`.
+Split both branches and select every twelfth frame for `ssim=shortest=1`.
+Use 120 instead of 60 for the synthetic reference. None of these scoring
+filters are applied to saved candidate videos.
+
+### End-to-end checks
+
+- Required `cargo test --workspace` and
+  `cargo clippy --workspace --exclude clippr-gui --all-targets -- -D warnings` pass.
+  Cargo uses `CARGO_TARGET_DIR=target/daemon`.
+- Isolated release smoke tests pass at 720p30 and 1080p120 for VA H.264, HEVC,
+  AV1 and software H.264. At 1080p120, five-second H.264 and two-second codec
+  saves contained 6.050 / 3.050 / 3.050 / 3.050 seconds, with two-second
+  keyframe gaps. Checks include clean full decode, keyframe/PTS zero at the
+  start, PTS=DTS for every packet, unchanged dimensions/fps, audio start within
+  50ms and stream ends within 80ms, sidecars/thumbnails, IPC/lifecycle behavior.
+- The old animated ball fixture itself measured only 155fps before any encoding
+  and could not sustain the complete 1080p120 pipeline. The test source now uses
+  cached NV12 color bars (about 8,888fps generation alone). It does not lower
+  resolution or fps. Quality/headroom is separately checked with high-motion
+  lossless media. The production DMA-BUF path is unchanged.
+- The 30s/3,600-frame high-motion source encoded in 16.15s H.264, 10.99s HEVC,
+  and 10.89s AV1 with the final settings, including CPU reference decode/upload.
+  That is at least 1.86x / 2.73x / 2.75x real-time throughput on these runs.
+  It is a throughput check, not a measurement of GPU utilization during gaming.
+
+Live CPU checks used copied restore tokens and isolated config/state/cache/runtime/
+data directories, real PipeWire audio, 1920x1080 with a **60fps maximum**, H.264
+and desktop AAC160. DMA-BUF source and VA-memory encoder input were verified.
+After a 35s warmup, stable-thread `schedstat` measurements over 45s gave:
+
+| Capture path | Sum of thread CPU / one core | Process tick cross-check |
+|---|---:|---:|
+| Baseline | 1.818% | 1.822% |
+| New settings | 1.271% | 1.267% |
+
+The new binary used `--no-tray` to match the baseline without the independently
+added tray feature. Source delivery was variable rate: the verification saves
+averaged 51.86fps before and 46.41fps after. Therefore these runs show **no
+observed CPU increase**, but do not establish a causal 30% encoder-CPU improvement
+at identical frame delivery. The strict under-1% architecture target is still
+unmet. The initial 13s-warmup samples were rejected when thread sets changed;
+they were discarded, not averaged into these results. Both final live saves
+started at zero on a keyframe with PTS=DTS, decoded cleanly, and contained
+5.283s / 5.925s of video for five-second requests, with audio aligned within one
+AAC frame at the start and less than 30ms at the end. Each isolated daemon was
+shut down using its own socket, with captured-PID termination only as cleanup.
+
+
+### User-reported stutter during benchmarking
+
+The supplied 23:45:53 clip came from the old running installed daemon, not this
+build: `/proc/<service PID>/exe`, the current installed file, and the new binary
+had distinct SHA-256 hashes. The service still held a deleted executable from
+23:32; no install or service restart was performed here. Its 30.217s video has
+907 frames and a repeating 16.7/16.7/66.7ms cadence (about 30fps despite a 60fps
+maximum). Audio packet timestamps are continuous at 1,024 samples/48kHz;
+continuous timestamps do not prove the audible signal has no glitches.
+Concurrent hardware prototypes may have contributed to contention; they were
+stopped on the report and remaining tests ran serially after the user finished
+gaming. This is not proof that bitrate settings fix that pre-existing capture
+cadence. No real clip, config, socket or portal token was overwritten.
+
 ## Follow-up validation
 
 - Saving now chooses the last keyframe at or before the requested start, or the

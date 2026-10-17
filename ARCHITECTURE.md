@@ -23,8 +23,9 @@ editor export (`edit.rs`) and IPC client (`client.rs`).
 - CPU while recording: under 1% of one core on a modern desktop. The frame path must stay on
   the GPU: PipeWire DMA-BUF in, VAAPI scale/convert, VAAPI encode, encoded bytes out. No raw
   frame may be copied to system memory on the hardware path.
-- RAM: the ring buffer of encoded packets plus under 40 MB of process overhead. 62s of
-  1440p60 H.264 at 16 Mbps is about 125 MB.
+- RAM: the ring buffer of encoded packets plus under 40 MB of process overhead. 63s of
+  1440p60 H.264 at the 16 Mbps preset budget is about 126 MB; easy scenes use less.
+  VA rate control is a nominal budget, not a strict byte limit (see codec validation).
 - GPU: one hardware encode session. No shaders beyond `vapostproc`.
 - Idle wakeups: no polling loops. Everything is event driven (GStreamer bus, D-Bus signals,
   socket readiness).
@@ -39,18 +40,31 @@ editor export (`edit.rs`) and IPC client (`client.rs`).
 2. **Video.** GStreamer:
    `pipewiresrc fd=<portal fd> path=<node id> do-timestamp=true keepalive-time=<1000/fps>`
    → DMA-BUF caps → `vapostproc` (scale to `video.resolution`, convert to NV12, VA memory)
-   → `vah264enc` / `vah265enc` / `vaav1enc` (CBR/VBR at `Config::video_bitrate_kbps`,
-   `key-int-max` = fps so there is a keyframe every second, no B-frames)
+   → `vah264enc` / `vah265enc` / `vaav1enc` (preset VBR at
+   `Config::video_bitrate_kbps(height)`, `target-percentage=100`, two-second CPB,
+   `target-usage=1`; preset `min-qp` stops wasting bits on easy content). H.264/HEVC
+   Low/Medium/High QP floors are 26/20/16; AV1 quantizer-index floors are 100/60/40.
+   Custom keeps the unscaled user bitrate and the encoder's default rate control.
+   Drivers without VBR retain their default mode with a warning. GOPs span at most
+   two seconds (`KEYFRAME_INTERVAL_SECS`), enforced by both frame count and arriving
+   timestamps. No H.26x B-frames; AV1 `hierarchical-level=1` disables future references
    → `h264parse`/`h265parse`/`av1parse` with `config-interval=-1` → `appsink`.
    Fallback when VAAPI fails or `encoder = software`: `videoconvert ! videoscale ! x264enc
-   speed-preset=superfast tune=zerolatency` (H.264 only). Framerate cap via caps on the
+   speed-preset=superfast tune=zerolatency` (H.264 only), capped CRF via `pass=qual`
+   and the same 26/20/16 quality levels, two-second VBV; Custom retains bitrate mode.
+   Preset budgets scale linearly from the 60fps table with configured maximum fps,
+   preserving bits/frame at 30/60/120/144fps. Resolution and capture rate are unchanged.
+   Framerate cap via caps on the
    PipeWire stream (`max-framerate`), not a `videorate` element.
 3. **Audio.** Desktop audio from the default sink monitor, optional mic from the default (or
    named) source, mixed with `audiomixer`, encoded with `fdkaacenc` (fallback `avenc_aac`)
    at `audio.bitrate_kbps`. Both from `pipewiresrc`. Separate appsink.
 4. **Ring buffer.** A `VecDeque` of encoded samples per stream (`Arc<[u8]>` or `gst::Buffer`,
-   PTS, duration, keyframe flag). Trim from the front by PTS so the buffer holds
-   `General::buffer_secs()` of video. Trimming keeps the oldest retained video sample a
+   PTS, duration, keyframe flag). Encoders output presentation order, so DTS equals PTS;
+   enabling reordering would require redesigning discontinuity detection, trimming and muxing.
+   Trim from the front by PTS so the buffer holds
+   `General::buffer_secs()` of video (longest clip + GOP duration + one second of
+   stream-skew slack). Trimming keeps the oldest retained video sample a
    keyframe. Keep codec headers (caps / codec_data) alongside.
 5. **Saving.** On save, take a cheap snapshot of the deques under a short lock, then mux on a
    background thread at low priority (`SCHED_IDLE` or nice 19): start at the last video
@@ -96,8 +110,11 @@ External tools are always invoked with an argument vector, never through a shell
 
 `edit::export` uses `ffmpeg`. Fast mode stream-copies each kept segment (cut points snap to
 keyframes) and concatenates them with the concat demuxer. Precise mode re-encodes with
-`h264_vaapi` (`-vaapi_device /dev/dri/renderD128`), falling back to `libx264 -preset veryfast`,
-using `trim`/`atrim` + `concat` filters. Progress comes from `-progress pipe:1`.
+the source codec's VAAPI encoder (`-vaapi_device /dev/dri/renderD128`), using the shared
+Medium VBR budget, QP floor and two-second GOP, no frame reordering, and passthrough frame
+timing. Hardware failure falls back to H.264 `libx264 -preset veryfast -crf 20` with the
+shared H.264 bitrate/VBV budget. `trim`/`atrim` + `concat` filters preserve precise cuts.
+Progress comes from `-progress pipe:1`.
 
 ## Config
 

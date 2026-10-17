@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use clippr_core::config::{Codec, Config};
+use clippr_core::config::{Codec, Config, KEYFRAME_INTERVAL_SECS};
 use gstreamer::{self as gst, prelude::*};
 use gstreamer_app as app;
 use tokio::sync::mpsc;
@@ -88,8 +88,11 @@ pub fn build(
     let mut bitrate_config = config.clone();
     bitrate_config.video.codec = codec;
     let bitrate = bitrate_config.video_bitrate_kbps(height);
+    let keyframes = fps * KEYFRAME_INTERVAL_SECS;
     let source = if test {
-        format!("videotestsrc name=screen is-live=true pattern=ball ! video/x-raw,width={source_width},height={source_height},framerate={fps}/1 ! ")
+        // Cached color bars keep CPU generation out of the real-time test's
+        // budget: the animated ball alone nearly saturates a core at 1080p120.
+        format!("videotestsrc name=screen is-live=true pattern=smpte75 ! video/x-raw,format=NV12,width={source_width},height={source_height},framerate={fps}/1 ! ")
     } else {
         let screen = screen.as_ref().context("no portal source")?;
         format!(
@@ -105,10 +108,17 @@ pub fn build(
         )
     };
     let convert = if software {
-        format!("videoconvert ! videoscale ! video/x-raw,format=I420,width={width},height={height} ! x264enc name=encoder bitrate={bitrate} key-int-max={fps} bframes=0 speed-preset=superfast tune=zerolatency ! ")
+        let quality = bitrate_config.video.quality_quantizer().map_or_else(
+            || "pass=cbr".to_owned(),
+            |qp| format!("pass=qual quantizer={qp}"),
+        );
+        format!("videoconvert ! videoscale ! video/x-raw,format=I420,width={width},height={height} ! x264enc name=encoder bitrate={bitrate} {quality} vbv-buf-capacity=2000 key-int-max={keyframes} bframes=0 speed-preset=superfast tune=zerolatency ! ")
     } else {
-        format!("vapostproc name=postproc ! video/x-raw(memory:VAMemory),format=NV12,width={width},height={height} ! {encoder} name=encoder bitrate={bitrate} key-int-max={fps} {} ! ",
-            if codec == Codec::Av1 { "" } else { "b-frames=0" })
+        // Ring trimming and MP4 saving require presentation order (DTS == PTS).
+        // AV1's future references must also be disabled, not just H.26x B-frames.
+        format!("vapostproc name=postproc ! video/x-raw(memory:VAMemory),format=NV12,width={width},height={height} ! {encoder} name=encoder bitrate={bitrate} cpb-size={} target-usage=1 key-int-max={keyframes} {} ! ",
+            bitrate * 2,
+            if codec == Codec::Av1 { "hierarchical-level=1" } else { "b-frames=0" })
     };
     let mut description = format!("{source}{convert}{parser} ! {caps} ! appsink name=video sync=false enable-last-sample=false max-buffers=8");
     if config.audio.capture_desktop || config.audio.capture_mic {
@@ -146,6 +156,30 @@ pub fn build(
         height,
         codec: codec_name.into(),
     };
+    if !software {
+        let encoder = capture
+            .pipeline
+            .by_name("encoder")
+            .context("missing encoder")?;
+        // Rate-control modes are driver-specific enum values. Older VA drivers
+        // may lack VBR; keep their default rather than breaking capture startup.
+        let vbr = encoder
+            .find_property("rate-control")
+            .and_then(|p| gst::glib::EnumClass::with_type(p.value_type()))
+            .is_some_and(|class| class.value_by_nick("vbr").is_some());
+        if let Some(qp) = bitrate_config.video.quality_quantizer() {
+            if vbr {
+                // VBR with a QP floor avoids spending the budget on easy frames.
+                // Unlike QVBR on radeonsi, this does not chase a quality target
+                // regardless of bitrate. 100% makes bitrate the nominal maximum.
+                encoder.set_property_from_str("rate-control", "vbr");
+                encoder.set_property("target-percentage", 100u32);
+                encoder.set_property("min-qp", qp);
+            } else {
+                tracing::warn!("VA encoder lacks VBR; using its default rate control");
+            }
+        }
+    }
     if let Some(desktop) = capture.pipeline.by_name("desktop") {
         // WirePlumber routes this stream to the default sink's monitor, tracking default
         // sink changes. Ordinary audio input would silently record the microphone.
@@ -228,9 +262,9 @@ pub fn build(
                 .build(),
         );
     }
-    // PipeWire is variable-rate on a quiet desktop. A GOP of `fps` frames alone
+    // PipeWire is variable-rate on a quiet desktop. A GOP limit in frames alone
     // can span several seconds. Request a keyframe from arriving buffer timestamps,
-    // so sparse captures still have one-second seek points, without a timer.
+    // so sparse captures still have bounded GOPs, without a timer.
     let encoder_pad = capture
         .pipeline
         .by_name("encoder")
@@ -246,7 +280,9 @@ pub fn build(
                     if let Some(pts) = buffer.pts() {
                         if pts.nseconds() >= next_keyframe.load(Ordering::Relaxed) {
                             next_keyframe.store(
-                                pts.nseconds().saturating_add(1_000_000_000),
+                                pts.nseconds().saturating_add(
+                                    u64::from(KEYFRAME_INTERVAL_SECS) * 1_000_000_000,
+                                ),
                                 Ordering::Relaxed,
                             );
                             pad.send_event(

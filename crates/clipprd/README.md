@@ -56,11 +56,17 @@ set nice 10; saving and thumbnail generation use nice 19 and idle I/O priority.
 No timer publishes status and no loop polls the desktop, keyboard, child process,
 or capture bus. On a quiet desktop PipeWire can deliver fewer frames than the
 configured maximum. Keyframes are requested from incoming timestamps as well as
-from the encoder GOP limit, preserving one-second seek points at variable rates.
+from the encoder GOP limit, preserving two-second seek points at variable rates.
 A saved clip begins at the last available keyframe at or before the requested
-start, using the ring's two seconds of slack. It includes at least the requested
+start, using the ring's three seconds of slack. It includes at least the requested
 duration whenever that much history is available; otherwise it saves all available
 history from the oldest keyframe.
+
+Preset encodes use VBR with a quality ceiling (QP floor) so flat scenes do not fill
+the bitrate budget. Budgets scale with configured maximum fps; Custom remains the
+user's bitrate. The `Config::video_bitrate_kbps(height)` API is unchanged and remains
+the Settings memory estimate input. See `VALIDATION.md` for measured savings,
+codec comparisons and the VA driver's bitrate overshoot caveat.
 
 ## Verification
 
@@ -78,7 +84,7 @@ keyframes/audio/duration/sidecars/thumbnails, and exercises IPC limits, events,
 live config, pause/resume, source reset, duplicate-instance rejection, overlay
 termination/reaping, and shutdown. It requires the corresponding VA plugins.
 
-`--test-source` selects live `videotestsrc` and `audiotestsrc`, skips desktop
+`--test-source` selects live NV12 color bars (`videotestsrc`) and `audiotestsrc`, skips desktop
 portals/hotkeys/focus tracking, and otherwise uses the same ring/mux/IPC path. Its
 raw frame generator runs on the CPU; its CPU figures do not represent DMA-BUF
 screen capture. For isolated live portal tests, point all four config/state/cache/

@@ -16,17 +16,20 @@ import tempfile
 import time
 
 binary = Path(sys.argv[1]).resolve()
+fps = int(os.environ.get('CLIPPR_SMOKE_FPS', '30'))
+resolution = os.environ.get('CLIPPR_SMOKE_RESOLUTION', 'p720')
 
 with tempfile.TemporaryDirectory(prefix='clipprd-smoke-') as tmp:
     root = Path(tmp)
     env = dict(os.environ, XDG_RUNTIME_DIR=tmp, XDG_CONFIG_HOME=tmp + '/config',
-               XDG_STATE_HOME=tmp + '/state', XDG_CACHE_HOME=tmp + '/cache')
+               XDG_STATE_HOME=tmp + '/state', XDG_CACHE_HOME=tmp + '/cache',
+               XDG_DATA_HOME=tmp + '/data')
     config_dir = root / 'config/clippr'
     config_dir.mkdir(parents=True)
     (config_dir / 'config.toml').write_text(
         f'[general]\nclips_dir = "{tmp}/clips"\nclip_short_secs = 5\n'
         'clip_long_secs = 8\nnotify_on_save = false\n'
-        '[video]\nfps = 30\nresolution = "p720"\n')
+        f'[video]\nfps = {fps}\nresolution = "{resolution}"\n')
     # The stub tests child spawning, SIGTERM and reaping without starting the GUI.
     stub_dir = root / 'bin'
     stub_dir.mkdir()
@@ -92,18 +95,24 @@ with tempfile.TemporaryDirectory(prefix='clipprd-smoke-') as tmp:
             video = next(s for s in probe['streams'] if s['codec_type'] == 'video')
             assert video['codec_name'] == codec, probe
             assert video.get('has_b_frames', 0) == 0, probe
-            assert seconds <= float(video['duration']) <= seconds + 1.1, probe
-            packets = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v', '-show_packets', '-show_entries', 'packet=pts_time,flags', '-of', 'json', str(path)]))['packets']
+            assert seconds <= float(video['duration']) <= seconds + 2.1, probe
+            packets = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v', '-show_packets', '-show_entries', 'packet=pts_time,dts_time,flags', '-of', 'json', str(path)]))['packets']
             assert 'K' in packets[0]['flags'] and float(packets[0]['pts_time']) == 0, packets[0]
+            assert all(p['pts_time'] == p['dts_time'] for p in packets), packets[:5]
             keys = [float(p['pts_time']) for p in packets if 'K' in p['flags']]
-            assert all(b-a <= 1.1 for a, b in zip(keys, keys[1:])), keys
-            subprocess.run(['ffmpeg', '-v', 'error', '-i', str(path), '-f', 'null', '-'], check=True, capture_output=True, timeout=20)
+            assert all(b-a <= 2.1 for a, b in zip(keys, keys[1:])), keys
+            audio = next(s for s in probe['streams'] if s['codec_type'] == 'audio')
+            assert 0 <= float(audio['start_time']) < .05, audio
+            assert abs(float(audio['start_time']) + float(audio['duration']) - float(video['duration'])) < .08, probe
+            assert video['height'] == {'p720': 720, 'p1080': 1080}[resolution], video
+            assert abs(float(video['avg_frame_rate'].split('/')[0]) / float(video['avg_frame_rate'].split('/')[1]) - fps) < .1, video
+            subprocess.run(['ffmpeg', '-v', 'error', '-xerror', '-i', str(path), '-f', 'null', '-'], check=True, capture_output=True, timeout=20)
             assert json.loads(path.with_suffix('.json').read_text()) == clip
             wait_for(lambda: (root / 'cache/clippr/thumbs' / (clip['id'] + '.jpg')).exists())
             print(codec, 'duration=', probe['format']['duration'], 'keyframes=', keys, flush=True)
             return clip
 
-        time.sleep(6)
+        time.sleep(8)
         first = save_and_probe(5, 'h264')
         while True:
             event = json.loads(event_file.readline())['event']

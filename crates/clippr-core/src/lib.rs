@@ -3,6 +3,7 @@
 //! This crate is the contract between processes. Changing a serialized type
 //! here changes the on-disk config, the sidecar format or the IPC protocol.
 
+pub mod audio;
 pub mod client;
 pub mod clip;
 pub mod config;

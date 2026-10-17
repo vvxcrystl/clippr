@@ -28,6 +28,9 @@ fn duration(path: &std::path::Path) -> f64 {
 
 #[test]
 fn media_library_and_exports() -> anyhow::Result<()> {
+    // Audio export coverage does not need GPU work. An unavailable test driver
+    // exercises the existing software fallback without disturbing a live recorder.
+    std::env::set_var("LIBVA_DRIVER_NAME", "clippr_test_no_vaapi");
     let tmp = tempfile::tempdir()?;
     // This integration test runs alone in its process; all XDG writes are isolated.
     std::env::set_var("XDG_CACHE_HOME", tmp.path().join("cache"));
@@ -142,6 +145,7 @@ fn media_library_and_exports() -> anyhow::Result<()> {
         title: "Edited".into(),
         precise: false,
         replace_source: false,
+        track_gains: vec![],
     };
     let fast = export(&lib, &req, &mut |p| values.push(p), &cancel)?;
     assert_eq!(fast.id, "source_edit");
@@ -279,5 +283,243 @@ fn media_library_and_exports() -> anyhow::Result<()> {
     std::os::unix::fs::symlink(&outside, spaced.dir().join("unsafe.mp4"))?;
     assert!(spaced.delete_permanently("unsafe").is_err());
     assert_eq!(std::fs::read_to_string(&outside)?, "do not follow");
+    Ok(())
+}
+
+fn probe_streams(path: &std::path::Path) -> Vec<serde_json::Value> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-show_streams", "-of", "json"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["streams"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+fn decoded_audio(path: &std::path::Path, index: u32) -> Vec<f32> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-map",
+            &format!("0:a:{index}"),
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            "-f",
+            "f32le",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    out.stdout
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect()
+}
+fn tone_amplitude(samples: &[f32], frequency: f64) -> f64 {
+    let samples = &samples[4800..samples.len().min(48000)];
+    let mut re = 0.0;
+    let mut im = 0.0;
+    for (i, &sample) in samples.iter().enumerate() {
+        let a = i as f64 * frequency * std::f64::consts::TAU / 48000.0;
+        re += f64::from(sample) * a.cos();
+        im += f64::from(sample) * a.sin();
+    }
+    re.hypot(im) * 2.0 / samples.len() as f64
+}
+fn video_hash(path: &std::path::Path) -> Vec<u8> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-map", "0:v:0", "-c", "copy", "-f", "hash", "-"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    out.stdout
+}
+
+#[test]
+fn multitrack_exports_preserve_sources_and_rebuild_only_mix() -> anyhow::Result<()> {
+    std::env::set_var("LIBVA_DRIVER_NAME", "clippr_test_no_vaapi");
+    use clippr_core::{clip::AudioTrackKind, edit::TrackGain};
+    let tmp = tempfile::tempdir()?;
+    let lib = Library::open(tmp.path());
+    let input = tmp.path().join("tracks.mp4");
+    let out = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=128x72:rate=20",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=660:sample_rate=48000",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=880:sample_rate=48000",
+            "-filter_complex",
+            "[1:a][2:a][3:a]amix=inputs=3:normalize=0[m]",
+            "-map",
+            "0:v",
+            "-map",
+            "[m]",
+            "-map",
+            "1:a",
+            "-map",
+            "2:a",
+            "-map",
+            "3:a",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "20",
+            "-bf",
+            "0",
+            "-c:a",
+            "aac",
+            "-t",
+            "4",
+            "-metadata:s:a:0",
+            "handler_name=Mix",
+            "-metadata:s:a:1",
+            "handler_name=Game",
+            "-metadata:s:a:2",
+            "handler_name=Microphone",
+            "-metadata:s:a:3",
+            "handler_name=Voice chat",
+        ])
+        .arg(&input)
+        .output()?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let source = lib.list()?.remove(0);
+    assert_eq!(
+        source
+            .audio_tracks
+            .iter()
+            .map(|t| t.kind)
+            .collect::<Vec<_>>(),
+        [
+            AudioTrackKind::Mix,
+            AudioTrackKind::Desktop,
+            AudioTrackKind::Mic,
+            AudioTrackKind::Voice
+        ]
+    );
+    let mut req = ExportRequest {
+        source_id: source.id.clone(),
+        keep: vec![Segment {
+            start_secs: 0.0,
+            end_secs: 4.0,
+        }],
+        title: "Tracks".into(),
+        precise: false,
+        replace_source: false,
+        track_gains: vec![],
+    };
+    let cancel = AtomicBool::new(false);
+    let unchanged = export(&lib, &req, &mut |_| (), &cancel)?;
+    req.track_gains = vec![
+        TrackGain {
+            kind: AudioTrackKind::Mic,
+            gain: 0.0,
+        },
+        TrackGain {
+            kind: AudioTrackKind::Voice,
+            gain: 0.5,
+        },
+    ];
+    let gained = export(&lib, &req, &mut |_| (), &cancel)?;
+    let unchanged_path = lib.video_path(&unchanged);
+    let gained_path = lib.video_path(&gained);
+    assert_eq!(video_hash(&unchanged_path), video_hash(&gained_path));
+    for index in 1..4 {
+        assert_eq!(
+            decoded_audio(&unchanged_path, index),
+            decoded_audio(&gained_path, index)
+        );
+    }
+    let mix = decoded_audio(&gained_path, 0);
+    let game = tone_amplitude(&mix, 440.0);
+    let mic = tone_amplitude(&mix, 660.0);
+    let voice = tone_amplitude(&mix, 880.0);
+    assert!(
+        game > 0.08 && mic < 0.002 && (voice / game - 0.5).abs() < 0.1,
+        "{game} {mic} {voice}"
+    );
+    assert_eq!(gained.audio_tracks, source.audio_tracks);
+    req.precise = true;
+    req.keep = vec![
+        Segment {
+            start_secs: 0.2,
+            end_secs: 1.2,
+        },
+        Segment {
+            start_secs: 2.2,
+            end_secs: 3.2,
+        },
+    ];
+    let precise = export(&lib, &req, &mut |_| (), &cancel)?;
+    assert!((precise.duration_secs - 2.0).abs() < 0.12);
+    let streams = probe_streams(&lib.video_path(&precise));
+    assert_eq!(
+        streams
+            .iter()
+            .filter(|s| s["codec_type"] == "audio")
+            .count(),
+        4
+    );
+    let mix = decoded_audio(&lib.video_path(&precise), 0);
+    assert!(tone_amplitude(&mix, 660.0) < 0.002);
+    for (index, freq) in [(1, 440.0), (2, 660.0), (3, 880.0)] {
+        assert!(tone_amplitude(&decoded_audio(&lib.video_path(&precise), index), freq) > 0.08);
+    }
+    // Legacy sidecars, missing field, and the Desktop alias for one mixed track.
+    let legacy_path = tmp.path().join("legacy.mp4");
+    assert!(Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&input)
+        .args(["-map", "0:v", "-map", "0:a:0", "-c", "copy"])
+        .arg(&legacy_path)
+        .status()?
+        .success());
+    lib.list()?;
+    let mut old = serde_json::to_value(lib.get("legacy")?)?;
+    old.as_object_mut().unwrap().remove("audio_tracks");
+    std::fs::write(tmp.path().join("legacy.json"), serde_json::to_vec(&old)?)?;
+    assert!(lib.get("legacy")?.audio_tracks.is_empty());
+    req.source_id = "legacy".into();
+    req.precise = false;
+    req.keep = vec![Segment {
+        start_secs: 0.0,
+        end_secs: 4.0,
+    }];
+    req.track_gains = vec![TrackGain {
+        kind: AudioTrackKind::Desktop,
+        gain: 0.0,
+    }];
+    let muted = export(&lib, &req, &mut |_| (), &cancel)?;
+    assert_eq!(muted.audio_tracks.len(), 1);
+    assert!(tone_amplitude(&decoded_audio(&lib.video_path(&muted), 0), 440.0) < 0.0001);
+    req.track_gains[0].gain = f32::NAN;
+    assert!(export(&lib, &req, &mut |_| (), &cancel).is_err());
     Ok(())
 }

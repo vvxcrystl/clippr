@@ -31,6 +31,9 @@ pub struct ClipMeta {
     /// Id of the clip this one was cut from.
     #[serde(default)]
     pub edited_from: Option<String>,
+    /// Empty on legacy sidecars: interpret as a single Mix track when audio exists.
+    #[serde(default)]
+    pub audio_tracks: Vec<AudioTrack>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,5 +54,55 @@ pub fn is_valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 200
         && !id.starts_with('.')
-        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Zero-based index among audio streams, independent of the video's stream index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioTrack {
+    pub index: u32,
+    pub kind: AudioTrackKind,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioTrackKind {
+    Mix,
+    Desktop,
+    Mic,
+    Voice,
+}
+
+impl AudioTrackKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mix => "Mix",
+            Self::Desktop => "Game",
+            Self::Mic => "Microphone",
+            Self::Voice => "Voice chat",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label.to_lowercase().as_str() {
+            "mix" => Some(Self::Mix),
+            "game" | "game/pc" | "desktop" => Some(Self::Desktop),
+            "microphone" | "mic" => Some(Self::Mic),
+            "voice chat" | "voice" | "discord" => Some(Self::Voice),
+            _ => None,
+        }
+    }
+}
+
+impl AudioTrack {
+    pub fn new(index: u32, kind: AudioTrackKind) -> Self {
+        Self {
+            index,
+            kind,
+            label: kind.label().into(),
+        }
+    }
 }

@@ -292,6 +292,28 @@ pub(crate) fn probe(path: &Path, id: &str) -> anyhow::Result<ClipMeta> {
         favorite: false,
         tags: vec![],
         edited_from: None,
+        audio_tracks: value["streams"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|s| s["codec_type"] == "audio")
+            .enumerate()
+            .map(|(index, stream)| {
+                use crate::clip::{AudioTrack, AudioTrackKind};
+                let label = stream["tags"]["title"]
+                    .as_str()
+                    .or_else(|| stream["tags"]["handler_name"].as_str())
+                    .filter(|s| !s.is_empty() && *s != "SoundHandler");
+                let kind = label
+                    .and_then(AudioTrackKind::from_label)
+                    .unwrap_or(AudioTrackKind::Mix);
+                AudioTrack {
+                    index: index as u32,
+                    kind,
+                    label: label.unwrap_or(kind.label()).into(),
+                }
+            })
+            .collect(),
     })
 }
 

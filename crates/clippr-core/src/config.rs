@@ -127,6 +127,10 @@ pub struct Audio {
     /// Record what the default output device plays.
     pub capture_desktop: bool,
     pub capture_mic: bool,
+    /// Save a compatibility mix followed by independently editable source tracks.
+    pub separate_tracks: bool,
+    /// Case-insensitive application identities excluded from Game/PC audio.
+    pub voice_apps: Vec<String>,
     /// PipeWire node name for the microphone. `None` means the default source.
     pub mic_device: Option<String>,
     pub bitrate_kbps: u32,
@@ -173,6 +177,20 @@ impl Default for Audio {
         Self {
             capture_desktop: true,
             capture_mic: false,
+            separate_tracks: true,
+            voice_apps: [
+                "discord",
+                "vesktop",
+                "webcord",
+                "armcord",
+                "legcord",
+                "equibop",
+                "discordcanary",
+                "discordptb",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
             mic_device: None,
             bitrate_kbps: 160,
         }
@@ -242,8 +260,7 @@ impl Config {
             crate::config::Codec::H264 => scaled,
             _ => scaled * 7 / 10,
         };
-        (u64::from(scaled) * u64::from(self.video.fps.clamp(1, 60)) / 60).clamp(500, 200_000)
-            as u32
+        (u64::from(scaled) * u64::from(self.video.fps.clamp(1, 60)) / 60).clamp(500, 200_000) as u32
     }
 }
 

@@ -1,5 +1,5 @@
 //! Clip trimming and cutting with cancellable ffmpeg exports.
-use crate::clip::ClipMeta;
+use crate::clip::{AudioTrack, AudioTrackKind, ClipMeta};
 use crate::config::{Codec, Config, KEYFRAME_INTERVAL_SECS};
 use crate::library::{probe, Library};
 use anyhow::{ensure, Context};
@@ -28,6 +28,15 @@ pub struct ExportRequest {
     pub precise: bool,
     /// Replace the source video and metadata while retaining its id.
     pub replace_source: bool,
+    #[serde(default)]
+    pub track_gains: Vec<TrackGain>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrackGain {
+    pub kind: AudioTrackKind,
+    /// Linear amplitude; zero mutes, one preserves the original amplitude.
+    pub gain: f32,
 }
 
 /// Export kept ranges. Progress stays in 0..=1; cancellation removes temporary output.
@@ -38,6 +47,7 @@ pub fn export(
     cancel: &AtomicBool,
 ) -> anyhow::Result<ClipMeta> {
     ensure!(!cancel.load(Ordering::Relaxed), "export cancelled");
+    crate::audio::validate_gains(&req.track_gains)?;
     let source = lib.get(&req.source_id)?;
     let input = lib.checked_video_path(&source)?;
     ensure!(
@@ -61,6 +71,32 @@ pub fn export(
         .collect();
     ensure!(!segments.is_empty(), "no nonempty segments to export");
     let total: f64 = segments.iter().map(|s| s.end_secs - s.start_secs).sum();
+    let probed = probe(&input, &source.id)?;
+    let audio_count = probed.audio_tracks.len();
+    let tracks = if source.audio_tracks.is_empty() {
+        probed.audio_tracks
+    } else {
+        source.audio_tracks.clone()
+    };
+    ensure!(
+        tracks.len() == audio_count,
+        "audio track metadata does not match the file"
+    );
+    ensure!(
+        tracks.iter().enumerate().all(|(i, t)| t.index == i as u32),
+        "invalid audio track indices"
+    );
+    let remix = !tracks.is_empty() && req.track_gains.iter().any(|g| g.gain != 1.0);
+    let output_tracks = if remix && tracks.len() > 1 && tracks[0].kind != AudioTrackKind::Mix {
+        std::iter::once(AudioTrack::new(0, AudioTrackKind::Mix))
+            .chain(tracks.iter().enumerate().map(|(i, t)| AudioTrack {
+                index: i as u32 + 1,
+                ..t.clone()
+            }))
+            .collect()
+    } else {
+        tracks.clone()
+    };
     let work = tempfile::tempdir_in(lib.dir())?;
     let output = work.path().join(
         if req.replace_source && input.extension().is_some_and(|e| e == "mkv") {
@@ -70,25 +106,9 @@ pub fn export(
         },
     );
     progress(0.0);
+    let mut cut_progress = |p| progress(p * if remix { 0.9f32 } else { 1.0f32 });
+    let cut_progress = &mut cut_progress as &mut dyn FnMut(f32);
     if req.precise {
-        let result = Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-select_streams",
-                "a",
-                "-show_entries",
-                "stream=index",
-                "-of",
-                "json",
-            ])
-            .arg(&input)
-            .output()?;
-        ensure!(result.status.success(), "cannot probe audio streams");
-        let audio = !serde_json::from_slice::<serde_json::Value>(&result.stdout)?["streams"]
-            .as_array()
-            .context("invalid audio probe")?
-            .is_empty();
         // Preserve the source codec on hardware rather than expanding HEVC/AV1
         // into H.264. Exports use the same Medium budget/quality rules as capture.
         let mut encoding = Config::default();
@@ -107,19 +127,17 @@ pub fn export(
                     s.start_secs, s.end_secs
                 ));
                 labels.push_str(&format!("[v{i}]"));
-                if audio {
-                    filter.push_str(&format!(
-                        "[0:a:0]atrim=start={}:end={},asetpts=PTS-STARTPTS[a{i}];",
-                        s.start_secs, s.end_secs
-                    ));
-                    labels.push_str(&format!("[a{i}]"));
+                for track in &tracks {
+                    let t = track.index;
+                    filter.push_str(&format!("[0:a:{t}]aresample=async=1:first_pts=0,apad,atrim=start={}:end={},asetpts=PTS-STARTPTS[a{i}_{t}];", s.start_secs, s.end_secs));
+                    labels.push_str(&format!("[a{i}_{t}]"));
                 }
             }
+            let audio_labels: String = tracks.iter().map(|t| format!("[a{}]", t.index)).collect();
             filter.push_str(&format!(
-                "{labels}concat=n={}:v=1:a={}[base]{};[base]{}[v]",
+                "{labels}concat=n={}:v=1:a={}[base]{audio_labels};[base]{}[v]",
                 segments.len(),
-                usize::from(audio),
-                if audio { "[a]" } else { "" },
+                tracks.len(),
                 if hardware {
                     "format=nv12,hwupload"
                 } else {
@@ -133,9 +151,11 @@ pub fn export(
             cmd.arg("-i")
                 .arg(&input)
                 .args(["-filter_complex", &filter, "-map", "[v]"]);
-            if audio {
-                cmd.args(["-map", "[a]", "-c:a", "aac", "-b:a", "160k"]);
+            for track in &tracks {
+                cmd.args(["-map", &format!("[a{}]", track.index)]);
             }
+            cmd.args(["-c:a", "aac", "-b:a", "160k"]);
+            track_metadata(&mut cmd, &tracks);
             if hardware {
                 let codec = match encoding.video.codec {
                     Codec::H264 => "h264_vaapi",
@@ -159,7 +179,7 @@ pub fn export(
             .arg((encoding.video.fps * KEYFRAME_INTERVAL_SECS).to_string())
             .args(["-fps_mode", "passthrough", "-movflags", "+faststart"])
             .arg(&output);
-            match run(cmd, total, progress, cancel) {
+            match run(cmd, total, cut_progress, cancel) {
                 Ok(()) => break,
                 Err(e) if hardware && !cancel.load(Ordering::Relaxed) => {
                     eprintln!("clippr: VAAPI export failed, using libx264: {e:#}");
@@ -184,7 +204,7 @@ pub fn export(
                     "-map",
                     "0:v:0",
                     "-map",
-                    "0:a:0?",
+                    "0:a?",
                     "-c",
                     "copy",
                     "-avoid_negative_ts",
@@ -194,7 +214,7 @@ pub fn export(
             run(
                 cmd,
                 duration,
-                &mut |p| progress(((elapsed + f64::from(p) * duration) / total * 0.8) as f32),
+                &mut |p| cut_progress(((elapsed + f64::from(p) * duration) / total * 0.8) as f32),
                 cancel,
             )?;
             elapsed += duration;
@@ -204,9 +224,53 @@ pub fn export(
         let mut cmd = ffmpeg();
         cmd.args(["-f", "concat", "-safe", "1", "-i"])
             .arg(work.path().join("concat.txt"))
-            .args(["-c", "copy", "-movflags", "+faststart"])
-            .arg(&output);
-        run(cmd, total, &mut |p| progress(0.8 + p * 0.2), cancel)?;
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+            ]);
+        track_metadata(&mut cmd, &tracks);
+        cmd.arg(&output);
+        run(cmd, total, &mut |p| cut_progress(0.8 + p * 0.2), cancel)?;
+    }
+    if remix {
+        let cut = work.path().join("cut.mp4");
+        std::fs::rename(&output, &cut)?;
+        let mut cmd = ffmpeg();
+        cmd.arg("-i").arg(&cut).args([
+            "-filter_complex",
+            &crate::audio::mix_filter(&tracks, &req.track_gains)?,
+            "-map",
+            "0:v:0",
+            "-map",
+            "[mix]",
+        ]);
+        for track in tracks
+            .iter()
+            .skip(usize::from(tracks[0].kind == AudioTrackKind::Mix))
+        {
+            if tracks.len() > 1 {
+                cmd.args(["-map", &format!("0:a:{}", track.index)]);
+            }
+        }
+        cmd.args([
+            "-c",
+            "copy",
+            "-c:a:0",
+            "aac",
+            "-b:a:0",
+            "160k",
+            "-movflags",
+            "+faststart",
+        ]);
+        track_metadata(&mut cmd, &output_tracks);
+        cmd.arg(&output);
+        run(cmd, total, &mut |p| progress(0.9 + p * 0.09), cancel)?;
     }
     ensure!(!cancel.load(Ordering::Relaxed), "export cancelled");
     let id = if req.replace_source {
@@ -231,6 +295,7 @@ pub fn export(
         }
     };
     let mut clip = probe(&output, &id)?;
+    clip.audio_tracks = output_tracks;
     clip.title = req.title.clone();
     clip.app = source.app.clone();
     clip.tags = source.tags.clone();
@@ -273,6 +338,20 @@ pub fn export(
     Ok(clip)
 }
 
+fn track_metadata(cmd: &mut Command, tracks: &[AudioTrack]) {
+    for track in tracks {
+        let index = track.index;
+        cmd.args([
+            &format!("-metadata:s:a:{index}"),
+            &format!("title={}", track.label),
+            &format!("-metadata:s:a:{index}"),
+            &format!("handler_name={}", track.label),
+            &format!("-disposition:a:{index}"),
+            &String::from(if index == 0 { "default" } else { "0" }),
+        ]);
+    }
+}
+
 fn ffmpeg() -> Command {
     let mut cmd = Command::new("nice");
     cmd.args([
@@ -286,6 +365,10 @@ fn ffmpeg() -> Command {
         "-progress",
         "pipe:1",
         "-nostats",
+        "-filter_complex_threads",
+        "1",
+        "-threads",
+        "1",
     ]);
     cmd
 }

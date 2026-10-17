@@ -8,7 +8,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use chrono::Local;
 use clippr_core::{
-    clip::{self, AppInfo, ClipMeta},
+    clip::{self, AppInfo, AudioTrack, AudioTrackKind, ClipMeta},
     config::Config,
     paths,
 };
@@ -69,15 +69,12 @@ fn feed(source: &app::AppSrc, packets: Vec<Packet>, start: u64) {
 }
 
 fn mux(snapshot: Snapshot, path: &Path) -> Result<()> {
-    let has_audio = !snapshot.audio.is_empty() && snapshot.audio_caps.is_some();
-    let description = format!(
-        "appsrc name=video format=time ! mux.video_0 {} mp4mux name=mux faststart=true ! filesink name=file",
-        if has_audio {
-            "appsrc name=audio format=time ! mux.audio_0"
-        } else {
-            ""
-        }
-    );
+    let mut description = "appsrc name=video format=time ! mux.video_0 mp4mux name=mux faststart=true ! filesink name=file".to_owned();
+    for i in 0..snapshot.audio.len() {
+        description.push_str(&format!(
+            " appsrc name=audio{i} format=time ! mux.audio_{i}"
+        ));
+    }
     let pipeline = gst::parse::launch(&description)?
         .downcast::<gst::Pipeline>()
         .map_err(|_| anyhow::anyhow!("mux is not a pipeline"))?;
@@ -99,14 +96,14 @@ fn mux(snapshot: Snapshot, path: &Path) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("mux video source is not appsrc"))?;
     video.set_caps(Some(&snapshot.video_caps));
     feed(&video, snapshot.video, snapshot.start);
-    if has_audio {
+    for (i, track) in snapshot.audio.into_iter().enumerate() {
         let audio = pipeline
-            .by_name("audio")
+            .by_name(&format!("audio{i}"))
             .context("missing mux audio source")?
             .downcast::<app::AppSrc>()
             .map_err(|_| anyhow::anyhow!("mux audio source is not appsrc"))?;
-        audio.set_caps(snapshot.audio_caps.as_ref());
-        feed(&audio, snapshot.audio, snapshot.start);
+        audio.set_caps(Some(&track.caps));
+        feed(&audio, track.packets, snapshot.start);
     }
     pipeline.set_state(gst::State::Playing)?;
     let bus = pipeline.bus().context("mux pipeline has no bus")?;
@@ -177,8 +174,94 @@ pub fn save(
         .unwrap_or(0)
         .max(0) as u32;
     let duration_secs = (snapshot.end - snapshot.start) as f64 / 1e9;
+    let input_tracks: Vec<_> = snapshot
+        .audio
+        .iter()
+        .enumerate()
+        .map(|(i, t)| AudioTrack::new(i as u32, t.kind))
+        .collect();
+    let separate = config.audio.separate_tracks && !input_tracks.is_empty();
+    let audio_tracks = if separate {
+        std::iter::once(AudioTrack::new(0, AudioTrackKind::Mix))
+            .chain(
+                input_tracks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| AudioTrack::new(i as u32 + 1, t.kind)),
+            )
+            .collect()
+    } else {
+        input_tracks.clone()
+    };
     let result = (|| {
-        mux(snapshot, &part)?;
+        if input_tracks.is_empty() {
+            mux(snapshot, &part)?;
+        } else {
+            let sources = tempfile::Builder::new()
+                .prefix(".clippr-sources-")
+                .suffix(".mp4.part")
+                .tempfile_in(dir)?;
+            mux(snapshot, sources.path())?;
+            let mut cmd = Command::new("ffmpeg");
+            cmd.env_remove("XDG_ACTIVATION_TOKEN")
+                .env_remove("DESKTOP_STARTUP_ID")
+                .args([
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-y",
+                    "-threads",
+                    "1",
+                    "-filter_complex_threads",
+                    "1",
+                    "-i",
+                ])
+                .arg(sources.path());
+            if separate {
+                cmd.args([
+                    "-filter_complex",
+                    &clippr_core::audio::mix_filter(&input_tracks, &[])?,
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "[mix]",
+                    "-map",
+                    "0:a",
+                    "-c",
+                    "copy",
+                    "-c:a:0",
+                    "aac",
+                    "-b:a:0",
+                    &format!("{}k", config.audio.bitrate_kbps),
+                ]);
+            } else {
+                cmd.args(["-map", "0", "-c", "copy"]);
+            }
+            for track in &audio_tracks {
+                cmd.arg(format!("-metadata:s:a:{}", track.index))
+                    .arg(format!("title={}", track.label))
+                    .arg(format!("-metadata:s:a:{}", track.index))
+                    .arg(format!("handler_name={}", track.label))
+                    .arg(format!("-disposition:a:{}", track.index))
+                    .arg(if track.index == 0 { "default" } else { "0" });
+            }
+            let output = cmd
+                .args([
+                    "-t",
+                    &duration_secs.to_string(),
+                    "-movflags",
+                    "+faststart",
+                    "-f",
+                    "mp4",
+                ])
+                .arg(&part)
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "mix/mux: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         let file = format!("{id}.mp4");
         let video_path = dir.join(&file);
         let size_bytes = fs::metadata(&part)?.len();
@@ -203,6 +286,7 @@ pub fn save(
             favorite: false,
             tags: vec![],
             edited_from: None,
+            audio_tracks,
         };
         let sidecar = dir.join(format!("{id}.json"));
         let tmp = dir.join(format!("{id}.json.part"));

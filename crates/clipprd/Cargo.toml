@@ -26,5 +26,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 gstreamer-video = { version = "0.25", features = ["v1_24"] }
 
-[dev-dependencies]
+pipewire = "0.10"
+
 tempfile = "3"

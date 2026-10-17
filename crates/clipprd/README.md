@@ -46,7 +46,8 @@ set nice 10; saving and thumbnail generation use nice 19 and idle I/O priority.
 
 - `main.rs`: current-thread Tokio actor, config, lifecycle, overlay children.
 - `portal.rs`: ScreenCast permissions, private token, GlobalShortcuts sessions.
-- `capture.rs`: GStreamer pipelines, encoded appsink callbacks, error bus handler.
+- `capture.rs`: GStreamer pipelines, source-track AAC encoders, encoded appsinks.
+- `audio.rs`: event-driven PipeWire discovery and per-application monitor taps.
 - `ring.rs`: bounded encoded history and keyframe-aligned snapshots.
 - `save.rs`: MP4 muxing, atomic sidecars, ffmpeg thumbnails, notifications.
 - `focus.rs`: event-driven KWin script; on-save Hyprland/Sway/X11 queries; Steam
@@ -96,3 +97,35 @@ its own data paths, so it will not find a desktop entry created only inside that
 sandbox; shortcut registration requires the normally installed launcher.
 
 See `VALIDATION.md` for the development-machine measurements and remaining limits.
+
+## Separate audio tracks
+
+`[audio] separate_tracks = true` is the default. Saved MP4s contain Mix first (and
+marked default), Game, optional Microphone, then Voice chat. Disable desktop capture
+to omit both Game and Voice; disable mic capture to omit Microphone. Disabling
+separate tracks retains the previous single mixed-track path.
+
+Game includes output streams playing to the default sink except voice applications.
+`voice_apps` matches application name, process binary and node name without case
+sensitivity, including full client identities for WebRTC streams. Defaults are
+`discord`, `vesktop`, `webcord`, `armcord`, `legcord`, `equibop`, plus Discord's
+`discordcanary` and `discordptb` binary/app-id variants. Add another app identity to
+this list to exclude it from Game and put it on Voice. A browser running Discord
+normally identifies as the browser; distinguishing individual browser tabs is not
+supported by PipeWire's application identity.
+
+The recorder creates additional monitor links into one passive capture stream per app,
+without creating virtual sinks, rerouting playback or changing defaults/volumes.
+Game and Voice use continuous silence-backed mixers, so absent/restarting apps do
+not reset timestamps. Mono and 44.1/48 kHz inputs are supported. Only source tracks
+are encoded while recording: Game at the configured stereo bitrate, mic at 96 kb/s
+mono, Voice at 96 kb/s stereo. Mix is decoded/mixed/encoded once on the low-priority
+save thread; video and source AAC are copied. All sources share video-aligned ring
+trimming and snapshot boundaries. Export track gains change only the Mix.
+
+The private PipeWire unit test starts its own server with no hardware/device
+modules. It checks two-app mixing, binary-based WebRTC classification, exclusion,
+mono/rate adaptation, restarts, default changes and playback-link preservation.
+It does not touch the session server. Core media tests explicitly disable VAAPI so
+audio export validation does not schedule GPU work beside a running recorder.
+The smoke script supports `CLIPPR_SMOKE_SOFTWARE_ONLY=1` for the same reason.

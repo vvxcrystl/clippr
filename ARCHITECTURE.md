@@ -57,21 +57,54 @@ editor export (`edit.rs`) and IPC client (`client.rs`).
    fixed bitrate. Resolution and capture rate are unchanged.
    Framerate cap via caps on the
    PipeWire stream (`max-framerate`), not a `videorate` element.
-3. **Audio.** Desktop audio from the default sink monitor, optional mic from the default (or
-   named) source, mixed with `audiomixer`, encoded with `fdkaacenc` (fallback `avenc_aac`)
-   at `audio.bitrate_kbps`. Both from `pipewiresrc`. Separate appsink.
+3. **Audio.** With `audio.separate_tracks=true` (the default), the daemon encodes only
+   source tracks: Game/PC (configured bitrate, stereo), optional Microphone (96 kb/s,
+   mono), and Voice chat (96 kb/s, stereo). There is **no resident Mix encoder**.
+   `fdkaacenc` falls back to `avenc_aac`; each source has its own encoded appsink.
+   A native `pipewire` registry listener watches nodes, full node/client identities,
+   ports, playback links and default-sink metadata. Every desktop output stream linked
+   to the default sink is tapped except configured voice apps. Voice app output is
+   tapped independently. Matching is case-insensitive against `application.name`,
+   `application.process.binary` and `node.name`, including client-property fallbacks.
+   Full identities are read before assigning a stream to Game, preventing WebRTC voice
+   streams from briefly leaking there during startup. The default `voice_apps` includes
+   discord, vesktop, webcord, armcord, legcord, equibop, discordcanary and discordptb.
+   Names match at word/path/app-id boundaries (not arbitrary substrings).
+
+   Each app has a native capture stream with autoconnect disabled, and additional
+   non-lingering monitor links from its existing output ports. Capture nodes are
+   passive; links request passive mode too, subject to the server's normal policy. No virtual sink is
+   created, no playback link is removed, and defaults, routing and volumes are never
+   changed. Native capture avoids GStreamer's indefinite negotiation wait for an
+   unconnected `pipewiresrc`. PipeWire adapts sample rates to 48 kHz; mono is duplicated
+   to stereo. Bounded, nonblocking appsrc queues feed Game and Voice `audiomixer`s on
+   the common capture timeline. Permanent silence inputs keep both encoders running
+   through idle periods, app exits and restarts. Audio samples are copied on the
+   non-real-time registry thread; the GPU video path remains untouched. Mic capture
+   uses the default/named `pipewiresrc` source. Pausing destroys taps, links and mixers.
+   With separation disabled, the existing sink-monitor/mic mixer and single encoder
+   remain in use.
 4. **Ring buffer.** A `VecDeque` of encoded samples per stream (`Arc<[u8]>` or `gst::Buffer`,
    PTS, duration, keyframe flag). Encoders output presentation order, so DTS equals PTS;
    enabling reordering would require redesigning discontinuity detection, trimming and muxing.
    Trim from the front by PTS so the buffer holds
    `General::buffer_secs()` of video (longest clip + GOP duration + one second of
    stream-skew slack). Trimming keeps the oldest retained video sample a
-   keyframe. Keep codec headers (caps / codec_data) alongside.
+   keyframe. One AAC deque per enabled source is trimmed against that same video
+   boundary; snapshots select every track against a common start/end. A timestamp
+   discontinuity clears all deques together. Keep codec headers alongside each stream.
 5. **Saving.** On save, take a cheap snapshot of the deques under a short lock, then mux on a
    background thread at low priority (`SCHED_IDLE` or nice 19): start at the last video
    keyframe at or before `now - seconds` (or the oldest keyframe if history is shorter),
    align audio by PTS, rebase timestamps to zero,
-   write `appsrc → mp4mux (faststart) → filesink` to `<clips_dir>/<id>.mp4.part`, then rename.
+   write `appsrc → mp4mux → filesink` into a temporary source-track MP4. On this
+   low-priority save thread, FFmpeg decodes those buffered AAC tracks, aligns initial
+   gaps, sums them and encodes Mix once at the configured bitrate. Video and source
+   AAC are stream-copied into the final faststart MP4, in audio order **Mix, Game,
+   Microphone, Voice chat**, omitting disabled sources. Mix alone is the default
+   audio stream, with readable MP4 titles and handler names on every track. The
+   temporary source file is removed automatically. Write the result to
+   `<clips_dir>/<id>.mp4.part`, then rename.
    Write the sidecar `<id>.json` ([`ClipMeta`]) atomically after the video. Then emit
    `Event::ClipSaved` and, if enabled, a desktop notification (org.freedesktop.Notifications
    over D-Bus). The capture pipeline is never paused or blocked by a save.
@@ -116,6 +149,34 @@ Medium VBR budget, QP floor and two-second GOP, no frame reordering, and passthr
 timing. Hardware failure falls back to H.264 `libx264 -preset veryfast -crf 20` with the
 shared H.264 bitrate/VBV budget. `trim`/`atrim` + `concat` filters preserve precise cuts.
 Progress comes from `-progress pipe:1`.
+
+All audio streams are retained in both modes. `ExportRequest::track_gains` changes
+only Mix: when any gain differs from one, rebuild it from the cut source tracks,
+leaving source-track volumes unchanged. Fast exports still stream-copy video and
+source AAC; only Mix is encoded. Precise exports trim/concatenate every audio stream
+and re-encode AAC for the precise cut, then rebuild Mix if requested. Legacy single
+tracks accept Mix or Desktop gain. Nonfinite/negative and duplicate gains are rejected.
+Cancellation applies to cutting and remixing, and temporary files roll back together.
+
+The additive shared contract is:
+
+```rust
+Audio { separate_tracks: bool, voice_apps: Vec<String>, /* existing fields */ }
+ClipMeta { audio_tracks: Vec<AudioTrack>, /* existing fields */ }
+pub struct AudioTrack { pub index: u32, pub kind: AudioTrackKind, pub label: String }
+pub enum AudioTrackKind { Mix, Desktop, Mic, Voice } // snake_case serde
+ExportRequest { track_gains: Vec<TrackGain>, /* existing fields */ }
+pub struct TrackGain { pub kind: AudioTrackKind, pub gain: f32 }
+```
+
+Indices are zero-based **audio** stream indices. Both new vectors have serde defaults;
+an empty legacy `audio_tracks` means one Mix track when the file has audio. Library
+probing fills tracks from ffprobe titles/handler names for files without sidecars.
+`edit::export` retains its existing signature. Shared `Audio::source_tracks() ->
+Vec<AudioTrackKind>` and `Audio::is_voice_app<'a>(identities: impl IntoIterator<Item =
+&'a str>) -> bool` define layout and matching. `AudioTrack::new(index: u32, kind:
+AudioTrackKind) -> AudioTrack`, `AudioTrackKind::label(self) -> &'static str` and
+`AudioTrackKind::from_label(label: &str) -> Option<AudioTrackKind>` define naming.
 
 ## Config
 

@@ -7,7 +7,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use clippr_core::config::{Codec, Config, KEYFRAME_INTERVAL_SECS};
+use clippr_core::{
+    clip::AudioTrackKind,
+    config::{Codec, Config, KEYFRAME_INTERVAL_SECS},
+};
 use gstreamer::{self as gst, prelude::*};
 use gstreamer_app as app;
 use tokio::sync::mpsc;
@@ -20,6 +23,7 @@ use crate::{
 
 pub struct Capture {
     pub pipeline: gst::Pipeline,
+    audio: Option<crate::audio::ApplicationAudio>,
     pub screen: Option<Screen>,
     pub encoder: String,
     pub width: u32,
@@ -28,6 +32,7 @@ pub struct Capture {
 }
 impl Drop for Capture {
     fn drop(&mut self) {
+        self.audio.take();
         let _ = self.pipeline.set_state(gst::State::Null);
         if let Some(bus) = self.pipeline.bus() {
             bus.unset_sync_handler();
@@ -121,17 +126,43 @@ pub fn build(
             if codec == Codec::Av1 { "hierarchical-level=1" } else { "b-frames=0" })
     };
     let mut description = format!("{source}{convert}{parser} ! {caps} ! appsink name=video sync=false enable-last-sample=false max-buffers=8");
-    if config.audio.capture_desktop || config.audio.capture_mic {
-        let aac = if gst::ElementFactory::find("fdkaacenc").is_some() {
-            "fdkaacenc"
+    let tracks = config.audio.source_tracks();
+    crate::lock(&ring).configure_audio(&tracks);
+    let aac = if gst::ElementFactory::find("fdkaacenc").is_some() {
+        "fdkaacenc"
+    } else {
+        "avenc_aac"
+    };
+    for (i, &kind) in tracks.iter().enumerate() {
+        let channels = if kind == AudioTrackKind::Mic { 1 } else { 2 };
+        let bitrate = if matches!(kind, AudioTrackKind::Mic | AudioTrackKind::Voice) {
+            96_000
         } else {
-            "avenc_aac"
+            config.audio.bitrate_kbps * 1000
         };
-        let audio_tail = format!("audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! {aac} bitrate={} ! audio/mpeg,mpegversion=4,stream-format=raw ! appsink name=audio sync=false enable-last-sample=false max-buffers=16", config.audio.bitrate_kbps * 1000);
+        let tail = format!("audioconvert ! audioresample ! audio/x-raw,rate=48000,channels={channels} ! {aac} bitrate={bitrate} ! audio/mpeg,mpegversion=4,stream-format=raw ! appsink name=audio{i} sync=false enable-last-sample=false max-buffers=16");
         if test {
-            description.push_str(&format!(" audiotestsrc is-live=true wave=sine volume=0.05 ! audio/x-raw,rate=48000,channels=2 ! {audio_tail}"));
+            let frequency = match kind {
+                AudioTrackKind::Mic => 660,
+                AudioTrackKind::Voice => 880,
+                _ => 440,
+            };
+            description.push_str(&format!(" audiotestsrc is-live=true wave=sine freq={frequency} volume=0.05 ! audio/x-raw,rate=48000,channels={channels} ! {tail}"));
+        } else if kind == AudioTrackKind::Desktop || kind == AudioTrackKind::Voice {
+            let name = if kind == AudioTrackKind::Desktop {
+                "desktop"
+            } else {
+                "voice"
+            };
+            // A permanent silent input anchors the timeline even when every app is
+            // gone. Dynamic taps inherit this pipeline's clock and base time.
+            description.push_str(&format!(" audiomixer name={name}_mix force-live=true ignore-inactive-pads=true latency=40000000 output-buffer-duration=21333333 ! {tail} audiotestsrc is-live=true wave=silence samplesperbuffer=1024 ! audio/x-raw,format=F32LE,rate=48000,channels=2 ! {name}_mix."));
+        } else if kind == AudioTrackKind::Mic {
+            description.push_str(&format!(
+                " pipewiresrc name=mic do-timestamp=true provide-clock=false ! {tail}"
+            ));
         } else if config.audio.capture_desktop && config.audio.capture_mic {
-            description.push_str(&format!(" audiomixer name=mix output-buffer-duration=21333333 ! {audio_tail} pipewiresrc name=desktop do-timestamp=true ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! mix. pipewiresrc name=mic do-timestamp=true ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! mix."));
+            description.push_str(&format!(" audiomixer name=mix output-buffer-duration=21333333 ! {tail} pipewiresrc name=desktop do-timestamp=true ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! mix. pipewiresrc name=mic do-timestamp=true ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! mix."));
         } else {
             let source = if config.audio.capture_desktop {
                 "desktop"
@@ -139,7 +170,7 @@ pub fn build(
                 "mic"
             };
             description.push_str(&format!(
-                " pipewiresrc name={source} do-timestamp=true ! {audio_tail}"
+                " pipewiresrc name={source} do-timestamp=true ! {tail}"
             ));
         }
     }
@@ -148,7 +179,8 @@ pub fn build(
     let pipeline = gst::parse::launch(&description)?
         .downcast::<gst::Pipeline>()
         .map_err(|_| anyhow::anyhow!("capture is not a pipeline"))?;
-    let capture = Capture {
+    let mut capture = Capture {
+        audio: None,
         pipeline,
         screen,
         encoder: encoder.into(),
@@ -202,13 +234,12 @@ pub fn build(
     }
     let streams_ready = Arc::new(AtomicU8::new(0));
     let reported_ready = Arc::new(AtomicBool::new(false));
-    let expected = if config.audio.capture_desktop || config.audio.capture_mic {
-        3
-    } else {
-        1
-    };
-    for (name, video) in [("video", true), ("audio", false)] {
-        let Some(sink) = capture.pipeline.by_name(name) else {
+    let expected = (1u8 << (tracks.len() + 1)) - 1;
+    let streams = std::iter::once(("video".to_owned(), None))
+        .chain((0..tracks.len()).map(|i| (format!("audio{i}"), Some(i))));
+    for (name, audio) in streams {
+        let video = audio.is_none();
+        let Some(sink) = capture.pipeline.by_name(&name) else {
             continue;
         };
         let sink = sink
@@ -239,7 +270,7 @@ pub fn build(
                         1_024_000_000_000 / 48_000
                     });
                     let keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
-                    crate::lock(&ring).push(
+                    crate::lock(&ring).push_stream(
                         Packet {
                             buffer,
                             pts,
@@ -247,10 +278,10 @@ pub fn build(
                             keyframe,
                         },
                         caps,
-                        video,
+                        audio,
                     );
                     if !ready.load(Ordering::Relaxed) {
-                        let flag = if video { 1 } else { 2 };
+                        let flag = 1 << audio.map_or(0, |i| i + 1);
                         let seen = streams_ready.fetch_or(flag, Ordering::Relaxed) | flag;
                         if seen == expected && !ready.swap(true, Ordering::Relaxed) {
                             tracing::debug!(%caps, "all encoded capture streams ready");
@@ -318,6 +349,17 @@ pub fn build(
         }
         gst::PadProbeReturn::Ok
     });
+    if !test && config.audio.separate_tracks && config.audio.capture_desktop {
+        let events = events.clone();
+        capture.audio = Some(crate::audio::ApplicationAudio::start(
+            &capture.pipeline,
+            &config.audio,
+            generation,
+            move |error| {
+                let _ = events.send(CaptureEvent::Failed(generation, error, false));
+            },
+        )?);
+    }
     capture
         .pipeline
         .bus()

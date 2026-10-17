@@ -18,6 +18,7 @@ import time
 binary = Path(sys.argv[1]).resolve()
 fps = int(os.environ.get('CLIPPR_SMOKE_FPS', '30'))
 resolution = os.environ.get('CLIPPR_SMOKE_RESOLUTION', 'p720')
+software_only = os.environ.get('CLIPPR_SMOKE_SOFTWARE_ONLY') == '1'
 
 with tempfile.TemporaryDirectory(prefix='clipprd-smoke-') as tmp:
     root = Path(tmp)
@@ -29,7 +30,9 @@ with tempfile.TemporaryDirectory(prefix='clipprd-smoke-') as tmp:
     (config_dir / 'config.toml').write_text(
         f'[general]\nclips_dir = "{tmp}/clips"\nclip_short_secs = 5\n'
         'clip_long_secs = 8\nnotify_on_save = false\n'
-        f'[video]\nfps = {fps}\nresolution = "{resolution}"\n')
+        f'[video]\nfps = {fps}\nresolution = "{resolution}"\n'
+        + ('encoder = "software"\n' if software_only else '')
+        + '[audio]\ncapture_mic = true\n')
     # The stub tests child spawning, SIGTERM and reaping without starting the GUI.
     stub_dir = root / 'bin'
     stub_dir.mkdir()
@@ -43,7 +46,7 @@ with tempfile.TemporaryDirectory(prefix='clipprd-smoke-') as tmp:
     env.update(PATH=str(stub_dir) + ':' + env['PATH'], OVERLAY_PID=str(root / 'overlay.pid'),
                XDG_ACTIVATION_TOKEN='stale-daemon-token', DESKTOP_STARTUP_ID='stale-startup-id')
     log = open(root / 'daemon.log', 'w+')
-    daemon = subprocess.Popen([str(binary), '--test-source', '--verbose'], env=env, stdout=log, stderr=log)
+    daemon = subprocess.Popen([str(binary), '--test-source', '--no-tray', '--verbose'], env=env, stdout=log, stderr=log)
 
     def connect():
         s = socket.socket(socket.AF_UNIX)
@@ -76,7 +79,7 @@ with tempfile.TemporaryDirectory(prefix='clipprd-smoke-') as tmp:
         event_file = subscriber.makefile('rb')
         assert json.loads(event_file.readline())['type'] == 'event'
         wait_for(lambda: request({'cmd': 'status'})['status']['state'] == 'recording')
-        second = subprocess.run([str(binary), '--test-source'], env=env, capture_output=True, timeout=5)
+        second = subprocess.run([str(binary), '--test-source', '--no-tray'], env=env, capture_output=True, timeout=5)
         assert second.returncode != 0 and b'another clipprd' in second.stderr
         with connect() as s:
             s.sendall(b'bad json\n{"cmd":"status"}\n')
@@ -91,7 +94,11 @@ with tempfile.TemporaryDirectory(prefix='clipprd-smoke-') as tmp:
             clip = request({'cmd': 'save', 'seconds': seconds})['clip']
             path = root / 'clips' / clip['file']
             probe = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(path)]))
-            assert {s['codec_type'] for s in probe['streams']} == {'video', 'audio'}, probe
+            settings = request({'cmd': 'get_config'})['config']['audio']
+            kinds = ['mix'] if settings['capture_desktop'] or settings['capture_mic'] else []
+            if settings['separate_tracks'] and kinds:
+                kinds += (['desktop'] if settings['capture_desktop'] else []) + (['mic'] if settings['capture_mic'] else []) + (['voice'] if settings['capture_desktop'] else [])
+            assert {s['codec_type'] for s in probe['streams']} == ({'video', 'audio'} if kinds else {'video'}), probe
             video = next(s for s in probe['streams'] if s['codec_type'] == 'video')
             assert video['codec_name'] == codec, probe
             assert video.get('has_b_frames', 0) == 0, probe
@@ -101,12 +108,19 @@ with tempfile.TemporaryDirectory(prefix='clipprd-smoke-') as tmp:
             assert all(p['pts_time'] == p['dts_time'] for p in packets), packets[:5]
             keys = [float(p['pts_time']) for p in packets if 'K' in p['flags']]
             assert all(b-a <= 2.1 for a, b in zip(keys, keys[1:])), keys
-            audio = next(s for s in probe['streams'] if s['codec_type'] == 'audio')
-            assert 0 <= float(audio['start_time']) < .05, audio
-            assert abs(float(audio['start_time']) + float(audio['duration']) - float(video['duration'])) < .08, probe
+            audio = [s for s in probe['streams'] if s['codec_type'] == 'audio']
+            labels = {'mix': 'Mix', 'desktop': 'Game', 'mic': 'Microphone', 'voice': 'Voice chat'}
+            assert [s['tags']['handler_name'] for s in audio] == [labels[k] for k in kinds], audio
+            assert [t['kind'] for t in clip['audio_tracks']] == kinds, clip
+            assert [t['index'] for t in clip['audio_tracks']] == list(range(len(kinds))), clip
+            if audio: assert audio[0]['disposition']['default'] == 1
+            assert [s['channels'] for s in audio] == [1 if k == 'mic' else 2 for k in kinds]
+            for track in audio:
+                assert 0 <= float(track['start_time']) < .05, track
+                assert abs(float(track['start_time']) + float(track['duration']) - float(video['duration'])) < .08, probe
             assert video['height'] == {'p720': 720, 'p1080': 1080}[resolution], video
             assert abs(float(video['avg_frame_rate'].split('/')[0]) / float(video['avg_frame_rate'].split('/')[1]) - fps) < .1, video
-            subprocess.run(['ffmpeg', '-v', 'error', '-xerror', '-i', str(path), '-f', 'null', '-'], check=True, capture_output=True, timeout=20)
+            subprocess.run(['ffmpeg', '-v', 'error', '-xerror', '-i', str(path), '-map', '0', '-f', 'null', '-'], check=True, capture_output=True, timeout=20)
             assert json.loads(path.with_suffix('.json').read_text()) == clip
             wait_for(lambda: (root / 'cache/clippr/thumbs' / (clip['id'] + '.jpg')).exists())
             print(codec, 'duration=', probe['format']['duration'], 'keyframes=', keys, flush=True)
@@ -119,7 +133,8 @@ with tempfile.TemporaryDirectory(prefix='clipprd-smoke-') as tmp:
             if event['kind'] == 'clip_saved':
                 assert event['clip']['id'] == first['id']
                 break
-        for codec, expected in [('hevc', 'hevc'), ('av1', 'av1'), ('h264', 'h264')]:
+        codecs = [('h264', 'h264')] if software_only else [('hevc', 'hevc'), ('av1', 'av1'), ('h264', 'h264')]
+        for codec, expected in codecs:
             config = request({'cmd': 'get_config'})['config']
             config['video']['codec'] = codec
             config['video']['encoder'] = 'software' if codec == 'h264' else 'hardware'
@@ -127,6 +142,13 @@ with tempfile.TemporaryDirectory(prefix='clipprd-smoke-') as tmp:
             wait_for(lambda: request({'cmd': 'status'})['status']['state'] == 'recording')
             time.sleep(3)
             save_and_probe(2, expected)
+        for desktop, mic, separate in [(True, False, True), (False, True, True), (True, True, False), (False, False, True)]:
+            config = request({'cmd': 'get_config'})['config']
+            config['audio'].update(capture_desktop=desktop, capture_mic=mic, separate_tracks=separate)
+            request({'cmd': 'set_config', 'config': config})
+            wait_for(lambda: request({'cmd': 'status'})['status']['state'] == 'recording')
+            time.sleep(3)
+            save_and_probe(2, 'h264')
         request({'cmd': 'set_paused', 'paused': True})
         paused = request({'cmd': 'status'})['status']
         assert paused['state'] == 'paused' and paused['buffer_bytes'] == 0 and paused['encoder'] is None
@@ -145,7 +167,7 @@ with tempfile.TemporaryDirectory(prefix='clipprd-smoke-') as tmp:
         request({'cmd': 'quit'})
         assert daemon.wait(timeout=10) == 0
         assert not (root / 'clippr.sock').exists()
-        daemon = subprocess.Popen([str(binary), '--test-source'], env=env, stdout=log, stderr=log)
+        daemon = subprocess.Popen([str(binary), '--test-source', '--no-tray'], env=env, stdout=log, stderr=log)
         wait_for(lambda: (root / 'clippr.sock').exists())
         assert request({'cmd': 'status'})['status']['state'] == 'paused'
         daemon.send_signal(signal.SIGTERM)

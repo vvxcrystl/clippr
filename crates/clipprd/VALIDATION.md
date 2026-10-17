@@ -450,3 +450,67 @@ these tests did not synthesize physical keys. The real GUI was not started by
 the smoke test: it used a disposable executable to verify overlay child lifecycle.
 Software fallback was exercised explicitly; automatic fallback after an injected
 hardware fault and the complete 2/5/15/60-second failure schedule remain untested.
+
+## Separate audio tracks — 2026-10-17
+
+The real service, socket, config, restore token, clips and audio routing were not
+modified. Daemon runs used isolated XDG config/state/cache/runtime/data directories,
+`--test-source --no-tray`. Audio graph validation uses a completely private PipeWire
+server with no hardware/device discovery modules; its null sink is test-only.
+
+The native per-app capture test verifies simultaneous 440/660 Hz game streams,
+880 Hz voice output identified by its full `application.process.binary=Discord`
+while its application name is `WEBRTC VoiceEngine`, exclusion from Game, 44.1/48 kHz
+adaptation, mono duplication, voice app removal/restart, short-lived streams,
+default-sink changes and preserving ordinary playback links after recorder cleanup.
+PipeWire may invalidate an object between announcement and bind: both ENOENT and
+ESTALE are normal registry races, reconciled by removal events, rather than capture
+failures. This fixed a failure found by running the complete suite concurrently.
+Tests also use the stock link factory policy: capture nodes are passive; a requested
+`link.passive` flag may be ignored by the server and derived from its node policies.
+No server policy is overridden.
+
+Core media fixtures verify ffprobe track discovery, legacy missing metadata,
+fast and precise multitrack exports, muting mic/attenuating Voice only in Mix,
+bit-identical copied video/source audio in fast mode, unchanged source volumes in
+precise mode, single-track Desktop gain compatibility and invalid gain rejection.
+Ring tests cover three source deques, byte accounting, shared trim/snapshot bounds
+and synchronized discontinuity reset. Required workspace test and Clippy commands
+pass, including the GUI (its existing editor edit was left untouched).
+
+Initial hardware smoke runs produced correctly ordered/titled, decodable Mix/Game/
+Microphone/Voice tracks for H.264, HEVC, AV1 and software H.264. **Hardware validation
+was stopped after GPU resets**, including a reported FFmpeg VAAPI context loss during
+export testing; KWin showed the user reset notifications. Some hardware validation
+ran concurrently with the first benchmark, so those initial CPU/RAM observations
+are discarded. This is not a clean hardware stability sign-off. No further GPU work
+was performed after the report. Core audio media tests now select an unavailable
+test VAAPI driver and exercise software fallback. The final software-only smoke
+also checks desktop-only, mic-only, single-mix and video-only configurations,
+all track names/default selection/channels, decoding, alignment, sidecars,
+subscriptions, IPC/lifecycle behavior and cleanup.
+
+A fresh **software video / synthetic audio** release comparison used 720p30,
+desktop + mic enabled, configured audio 160 kb/s, 65 s warmup followed by 20 s
+summed `/proc/PID/task/TID/schedstat` CPU measurement. Saving happened afterward.
+It never opened a portal or audio device. This deliberately does not repeat the
+live hardware baseline of ~1.8% and does not measure native per-app capture cost.
+
+- Separation off: **14.65%** of one CPU core; RSS **83.40 MiB**, PSS **75.29 MiB**;
+  encoded ring **1,727,742 bytes**. Saving a requested 60 s (61.1 s keyframe-aligned)
+  clip took **0.080 s**.
+- Separation on: **14.98%** of one CPU core; RSS **93.28 MiB**, PSS **85.23 MiB**;
+  encoded ring **3,193,171 bytes**. Saving 60 s (61.1 s keyframe-aligned) took
+  **0.642 s**, including decode/mix/AAC encode/remux.
+- Observed growth: **0.33 percentage points CPU**, **9.94 MiB PSS**, including
+  **1.40 MiB** more encoded history. These short synthetic observations include
+  software-video/allocator overhead and are not a production resource guarantee.
+- Final tracks: stereo Mix, stereo Game, mono Microphone, stereo Voice chat.
+  Mix started at 0; sources started at 0.016 s; all ended within 7 ms of video.
+  Every audio/video stream decoded successfully.
+
+Remaining: real Discord/Vesktop voice calls, physical mic timing, live per-app
+CPU/RAM at the desktop hardware path, and hardware stability after the observed
+resets. No claim is made that the strict under-1% target is met. Browser tabs share
+browser process identity; individual web Discord tabs cannot be distinguished.
+Surround layouts are not validated; current taps capture FL/FR or duplicate MONO.

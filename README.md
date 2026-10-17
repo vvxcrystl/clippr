@@ -18,6 +18,8 @@ in RAM, and the recorder has no polling loops. The GUI only runs while you have 
   Both lengths are configurable.
 - H.264, HEVC or AV1 through VAAPI, with an x264 fallback. Quality presets or a custom bitrate,
   plus a resolution and frame-rate cap. Desktop audio and an optional microphone.
+- A "Clip saved" popup in the screen corner with the clip's thumbnail and length. It draws above fullscreen games without taking focus.
+- A tray icon that shows when it's recording, with a menu to save, pause, or open the app.
 - A quick overlay (Alt+F8) to clip, pause, toggle audio sources, change quality, and rename the
   clip you just saved.
 - A library window with thumbnails, search, app and favorite filters, and sorting.

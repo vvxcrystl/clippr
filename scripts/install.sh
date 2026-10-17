@@ -5,7 +5,7 @@ cd "$repo_dir"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 cargo build --release --workspace
 install -d "$HOME/.local/bin"
-for binary in clipprd clippr clippr-gui; do
+for binary in clipprd clippr clippr-gui clippr-toast; do
     install -m 755 "$CARGO_TARGET_DIR/release/$binary" "$HOME/.local/bin/$binary"
 done
 if [[ -f packaging/clipprd.service ]]; then

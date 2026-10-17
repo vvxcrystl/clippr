@@ -4,6 +4,7 @@ mod ipc;
 mod portal;
 mod ring;
 mod save;
+mod toast;
 mod tray;
 
 use std::{
@@ -306,11 +307,7 @@ impl Daemon {
                         }
                     });
                 if notify {
-                    tokio::spawn(async move {
-                        if let Err(e) = save::notify(&clip).await {
-                            tracing::debug!(error = %e, "notification unavailable");
-                        }
-                    });
+                    toast::show(clip);
                 }
             }
             Err(e) => {

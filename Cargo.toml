@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/clippr-core", "crates/clipprd", "crates/clippr-cli", "crates/clippr-gui"]
+members = ["crates/clippr-core", "crates/clipprd", "crates/clippr-cli", "crates/clippr-gui", "crates/clippr-toast"]
 
 [workspace.package]
 version = "0.1.0"

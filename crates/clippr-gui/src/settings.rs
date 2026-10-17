@@ -166,7 +166,10 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay) -> gtk::Widget {
         move |c| r.set_subtitle(&glib::markup_escape_text(&c.general.clips_dir.display().to_string()))
     }));
 
-    let notify = adw::SwitchRow::builder().title("Notify when a clip is saved").build();
+    let notify = adw::SwitchRow::builder()
+        .title("Show a popup when a clip is saved")
+        .subtitle("A small card in the corner, above fullscreen games")
+        .build();
     clips.add(&notify);
     {
         let ed = ed.clone();

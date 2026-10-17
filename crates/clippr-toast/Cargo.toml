@@ -1,0 +1,16 @@
+[package]
+name = "clippr-toast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "clippr-toast"
+path = "src/main.rs"
+
+[dependencies]
+smithay-client-toolkit = { version = "0.21", default-features = false }
+wayland-client = "0.31"
+ab_glyph = "0.2"
+zune-jpeg = "0.4"
+libc = "0.2"

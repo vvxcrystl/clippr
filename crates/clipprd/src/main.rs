@@ -386,7 +386,9 @@ impl Daemon {
                     Response::Ok
                 }
                 Request::Quit => Response::Ok,
-                Request::Save { .. } => unreachable!(),
+                Request::Save { .. } => Response::Error {
+                    message: "save request reached the synchronous request handler".into(),
+                },
             })
         }
         .await;
@@ -437,6 +439,9 @@ async fn main() -> Result<()> {
     let config = Config::load()?;
     focus::validate_config(&config)?;
     let mut socket = ipc::Socket::bind()?;
+    if let Err(e) = save::sweep_parts(&config.general.clips_dir, std::time::SystemTime::now()) {
+        warn!(error = %e, "could not clean up stale partial clips");
+    }
     gstreamer::init()?;
     let (tx, mut rx) = mpsc::channel(64);
     let (capture_tx, mut capture_rx) = mpsc::unbounded_channel();

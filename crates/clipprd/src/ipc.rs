@@ -25,6 +25,8 @@ use tokio::{
 
 use crate::Message;
 const MAX_LINE: usize = 1024 * 1024;
+const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const IDLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Socket {
     pub listener: Option<UnixListener>,
@@ -134,12 +136,31 @@ async fn send<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, response: &Respo
 async fn connection(
     stream: UnixStream,
     tx: mpsc::Sender<Message>,
+    events: broadcast::Receiver<Event>,
+) -> Result<()> {
+    connection_with_deadlines(
+        stream,
+        tx,
+        events,
+        FIRST_REQUEST_TIMEOUT,
+        IDLE_REQUEST_TIMEOUT,
+    )
+    .await
+}
+
+async fn connection_with_deadlines(
+    stream: UnixStream,
+    tx: mpsc::Sender<Message>,
     mut events: broadcast::Receiver<Event>,
+    first_timeout: Duration,
+    idle_timeout: Duration,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
+    let mut deadline = first_timeout;
     loop {
-        let bytes = match line(&mut reader).await {
+        // A single deadline covers the whole line, including a trickle of partial bytes.
+        let bytes = match tokio::time::timeout(deadline, line(&mut reader)).await? {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Ok(()),
             Err(e) => {
@@ -153,6 +174,7 @@ async fn connection(
                 return Ok(());
             }
         };
+        deadline = idle_timeout;
         let request = match serde_json::from_slice::<Request>(&bytes) {
             Ok(req) => req,
             Err(e) => {
@@ -195,6 +217,47 @@ async fn connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_connections_release_their_slots() {
+        for partial in [false, true] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let (tx, mut requests) = mpsc::channel(1);
+            let (events, _) = broadcast::channel(1);
+            let slots = Arc::new(Semaphore::new(1));
+            let permit = slots.clone().acquire_owned().await.unwrap();
+            let task = tokio::spawn(async move {
+                let _permit = permit;
+                connection_with_deadlines(
+                    server,
+                    tx,
+                    events.subscribe(),
+                    Duration::from_millis(30),
+                    Duration::from_millis(60),
+                )
+                .await
+            });
+            if partial {
+                client.write_all(b"{\"cmd\":\"status\"}\n").await.unwrap();
+                let Message::Request(_, reply) = requests.recv().await.unwrap() else {
+                    panic!("expected request");
+                };
+                reply.send(Response::Ok).unwrap();
+                let mut reader = BufReader::new(&mut client);
+                assert!(line(&mut reader).await.unwrap().is_some());
+                // A partial second line must still expire.
+                client.write_all(b"{").await.unwrap();
+            }
+            assert!(tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err());
+            assert_eq!(slots.available_permits(), 1);
+            let mut byte = [0];
+            assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn bounded_lines_and_multiple_requests() {
         let mut reader = BufReader::new(&b"{\"cmd\":\"status\"}\n{\"cmd\":\"quit\"}\n"[..]);

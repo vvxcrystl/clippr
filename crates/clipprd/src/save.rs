@@ -5,7 +5,7 @@ use std::{
     process::Command,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::Local;
 use clippr_core::{
     clip::{self, AppInfo, ClipMeta},
@@ -254,6 +254,47 @@ pub fn thumbnail(clip: &ClipMeta, config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Remove abandoned save files without traversing directories or following symlinks.
+pub fn sweep_parts(dir: &Path, now: std::time::SystemTime) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.ends_with(".mp4.part") && !name.ends_with(".json.part") {
+            continue;
+        }
+        let meta = fs::symlink_metadata(entry.path())?;
+        if meta.is_file()
+            && now
+                .duration_since(meta.modified()?)
+                .is_ok_and(|age| age > std::time::Duration::from_secs(3600))
+        {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn notification_text(text: &str, max_chars: usize) -> String {
+    let mut escaped = String::new();
+    for c in text.chars().take(max_chars) {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
 pub async fn notify(clip: &ClipMeta) -> Result<()> {
     let connection = zbus::Connection::session().await?;
     let proxy = zbus::Proxy::new(
@@ -272,8 +313,8 @@ pub async fn notify(clip: &ClipMeta) -> Result<()> {
                 "clippr",
                 0u32,
                 "video-x-generic",
-                "Clip saved",
-                &clip.title,
+                notification_text("Clip saved", 200),
+                notification_text(&clip.title, 200),
                 Vec::<&str>::new(),
                 hints,
                 5000i32,
@@ -286,6 +327,56 @@ pub async fn notify(clip: &ClipMeta) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn escaped_bounded_notifications() {
+        assert_eq!(
+            notification_text("<&>\"'", 200),
+            "&lt;&amp;&gt;&quot;&apos;"
+        );
+        assert_eq!(notification_text(&"é".repeat(201), 200), "é".repeat(200));
+        assert_eq!(notification_text("<&", 1), "&lt;");
+    }
+
+    #[test]
+    fn sweep_only_old_regular_clip_parts() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let now = std::time::SystemTime::now();
+        for name in [
+            "old.mp4.part",
+            "old.json.part",
+            "fresh.mp4.part",
+            "other.part",
+            "clip.mp4",
+        ] {
+            let path = dir.path().join(name);
+            fs::write(&path, b"test")?;
+            if !name.starts_with("fresh") {
+                fs::File::options().write(true).open(&path)?.set_times(
+                    fs::FileTimes::new().set_modified(now - std::time::Duration::from_secs(3601)),
+                )?;
+            }
+        }
+        fs::create_dir(dir.path().join("directory.mp4.part"))?;
+        std::os::unix::fs::symlink(
+            dir.path().join("other.part"),
+            dir.path().join("link.mp4.part"),
+        )?;
+        sweep_parts(dir.path(), now)?;
+        for name in ["old.mp4.part", "old.json.part"] {
+            assert!(!dir.path().join(name).exists());
+        }
+        for name in [
+            "fresh.mp4.part",
+            "other.part",
+            "clip.mp4",
+            "directory.mp4.part",
+            "link.mp4.part",
+        ] {
+            assert!(dir.path().join(name).symlink_metadata().is_ok());
+        }
+        Ok(())
+    }
+
     #[test]
     fn safe_clip_slugs() {
         for name in [

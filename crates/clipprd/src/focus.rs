@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clippr_core::{clip::AppInfo, paths};
+use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -15,11 +16,28 @@ use tokio::{
 };
 
 #[derive(Clone, Default)]
-pub struct Focus(pub Arc<Mutex<Option<AppInfo>>>);
+pub struct Focus(
+    pub Arc<Mutex<Option<AppInfo>>>,
+    Arc<Mutex<Option<zbus::names::OwnedUniqueName>>>,
+);
 
 #[zbus::interface(name = "org.clippr.Daemon")]
 impl Focus {
-    fn focus_changed(&self, class: &str, title: &str, pid: &str) {
+    fn focus_changed(
+        &self,
+        class: &str,
+        title: &str,
+        pid: &str,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+    ) {
+        let owner = crate::lock(&self.1);
+        if !owner
+            .as_ref()
+            .is_some_and(|owner| hdr.sender() == Some(owner.inner()))
+        {
+            tracing::debug!(sender = ?hdr.sender(), "ignoring focus metadata from non-KWin peer");
+            return;
+        }
         let pid = pid.parse::<u32>().unwrap_or(0);
         tracing::debug!(class, pid, "focused application changed");
         let app = if class.is_empty() && pid == 0 {
@@ -36,10 +54,42 @@ impl Focus {
     }
 }
 
+// Abort on cancellation during startup too, so a timed-out start cannot leak a watcher.
+struct OwnerWatch(tokio::task::JoinHandle<()>);
+impl Drop for OwnerWatch {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn watch_kwin_owner(connection: &zbus::Connection, focus: &Focus) -> Result<OwnerWatch> {
+    let dbus = zbus::fdo::DBusProxy::new(connection).await?;
+    // Subscribe before querying so a concurrent owner change cannot be missed.
+    let mut changes = dbus
+        .receive_name_owner_changed_with_args(&[(0, "org.kde.KWin")])
+        .await?;
+    *crate::lock(&focus.1) = dbus.get_name_owner("org.kde.KWin".try_into()?).await.ok();
+    let kwin_name = zbus::names::BusName::try_from("org.kde.KWin")?;
+    let watched_focus = focus.clone();
+    Ok(OwnerWatch(tokio::spawn(async move {
+        while changes.next().await.is_some() {
+            let owner = dbus.get_name_owner(kwin_name.clone()).await.ok();
+            let mut cached_owner = crate::lock(&watched_focus.1);
+            if *cached_owner != owner {
+                *cached_owner = owner;
+                *crate::lock(&watched_focus.0) = None;
+            }
+        }
+        *crate::lock(&watched_focus.1) = None;
+        *crate::lock(&watched_focus.0) = None;
+    })))
+}
+
 pub struct Kwin {
     connection: zbus::Connection,
     pub focus: Focus,
     plugin: String,
+    _owner_watch: OwnerWatch,
 }
 impl Kwin {
     pub async fn start() -> Result<Self> {
@@ -49,6 +99,7 @@ impl Kwin {
             .serve_at("/org/clippr/Daemon", focus.clone())?
             .build()
             .await?;
+        let owner_watch = watch_kwin_owner(&connection, &focus).await?;
         let plugin = "clippr-focus".to_owned();
         let script = r#"var active = null;
 function send() {
@@ -97,6 +148,7 @@ report(workspace.activeWindow);
             connection,
             focus,
             plugin,
+            _owner_watch: owner_watch,
         })
     }
     pub async fn stop(self) {
@@ -344,4 +396,91 @@ pub fn validate_config(config: &clippr_core::config::Config) -> Result<()> {
         .to_str()
         .context("clips directory must be UTF-8")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_current_kwin_owner_can_report_focus() -> Result<()> {
+        // A private bus keeps the real session, KWin, and daemon untouched.
+        let mut bus = Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let stdout = bus.stdout.take().context("missing bus stdout")?;
+        let mut address = String::new();
+        BufReader::new(stdout).read_line(&mut address).await?;
+        let connect = || zbus::connection::Builder::address(address.trim());
+        let focus = Focus::default();
+        let daemon = connect()?
+            .serve_at("/org/clippr/Daemon", focus.clone())?
+            .build()
+            .await?;
+        let kwin = connect()?.name("org.kde.KWin")?.build().await?;
+        let outsider = connect()?.build().await?;
+        let _watch = watch_kwin_owner(&daemon, &focus).await?;
+        async fn report(
+            peer: &zbus::Connection,
+            daemon: &zbus::Connection,
+            title: &str,
+        ) -> Result<()> {
+            let proxy = zbus::Proxy::new(
+                peer,
+                daemon
+                    .unique_name()
+                    .context("missing unique name")?
+                    .as_str(),
+                "/org/clippr/Daemon",
+                "org.clippr.Daemon",
+            )
+            .await?;
+            proxy
+                .call::<_, _, ()>("FocusChanged", &("game", title, "123"))
+                .await?;
+            Ok(())
+        }
+        report(&outsider, &daemon, "spoof").await?;
+        assert!(crate::lock(&focus.0).is_none());
+        report(&kwin, &daemon, "accepted").await?;
+        assert_eq!(
+            crate::lock(&focus.0)
+                .as_ref()
+                .unwrap()
+                .window_title
+                .as_deref(),
+            Some("accepted")
+        );
+        kwin.release_name("org.kde.KWin").await?;
+        outsider.request_name("org.kde.KWin").await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if crate::lock(&focus.1).as_ref().map(|n| n.as_str())
+                    == outsider.unique_name().map(|n| n.as_str())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(crate::lock(&focus.0).is_none());
+        report(&kwin, &daemon, "former owner").await?;
+        assert!(crate::lock(&focus.0).is_none());
+        report(&outsider, &daemon, "new owner").await?;
+        assert_eq!(
+            crate::lock(&focus.0)
+                .as_ref()
+                .unwrap()
+                .window_title
+                .as_deref(),
+            Some("new owner")
+        );
+        bus.kill().await?;
+        bus.wait().await?;
+        Ok(())
+    }
 }

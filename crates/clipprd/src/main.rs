@@ -104,6 +104,12 @@ impl Daemon {
         self.ring = Arc::new(Mutex::new(ring::Ring::new(
             self.config.general.buffer_secs(),
         )));
+        // Encoded history can leave large freed arenas behind. Return those pages
+        // once at teardown; never run allocator maintenance on the frame path.
+        #[cfg(target_env = "gnu")]
+        unsafe {
+            libc::malloc_trim(0);
+        }
     }
     fn start_capture(&mut self) {
         self.stop_capture();

@@ -54,7 +54,8 @@ KWin reported `T3 Code (Nightly)` as the focused app and the title was
 
 ## Resource measurement
 
-One uninterrupted 30.007-second interval on the final release implementation,
+One uninterrupted 30.007-second interval on the release capture path (before
+the teardown-only allocator maintenance change),
 using `/proc/<pid>/stat` CPU ticks and one-second RSS samples, measured:
 
 - CPU: **1.60% of one core** (sum of user and kernel CPU time).
@@ -69,9 +70,13 @@ VA-memory negotiation were both verified, with no system-memory video fallback.
 A second 30-second thread breakdown attributed about 0.90% to the GStreamer
 video streaming thread, 0.30% to audio, and 0.27% to the Mesa command-submission
 thread; the daemon actor used 0.00% measured CPU.
-Paused capture measured 0.00% CPU over 10.000 seconds, with
-an empty ring and no encoder; paused RSS was 74.4 MiB and PSS
-was 44.2 MiB.
+A subsequent 30-second run of the final allocator change measured 1.80% CPU,
+77.0 MiB mean RSS and 59.2 MiB ending PSS while the buffer warmed. A concurrent
+synthetic codec smoke test ran during part of this second interval.
+Teardown now returns freed glibc arenas once, outside the recording path. Paused
+capture then measured 0.00% CPU over 10.000 seconds, with an empty
+ring and no encoder; paused RSS was 60.0 MiB and PSS was 29.7 MiB
+(down from 44.2 MiB PSS before the allocator trim).
 These are live desktop measurements, not a game/compile workload benchmark.
 The synthetic source generates raw frames on the CPU and is unsuitable for
 measuring the production hardware capture path.

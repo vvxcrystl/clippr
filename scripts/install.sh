@@ -2,7 +2,7 @@
 set -euo pipefail
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
-export CARGO_TARGET_DIR=target/lib
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 cargo build --release --workspace
 install -d "$HOME/.local/bin"
 for binary in clipprd clippr clippr-gui; do

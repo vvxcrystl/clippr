@@ -57,7 +57,7 @@ systemctl --user enable --now clipprd
 ```
 
 This builds in release mode and installs `clipprd`, `clippr` and `clippr-gui` to
-`~/.local/bin`, plus the systemd user unit. `./scripts/uninstall.sh` removes
+`~/.local/bin`, plus the systemd user unit, a desktop entry and the icon. `./scripts/uninstall.sh` removes
 them.
 
 ## Usage

@@ -8,7 +8,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use clippr_core::clip::ClipMeta;
-use clippr_core::library::Library;
+use clippr_core::library::{Library, TrashUnavailable};
 use gtk::{gdk, gio, glib};
 
 use crate::state::State;
@@ -790,7 +790,16 @@ impl ClipCard {
             }),
         );
         add("rename", Box::new(|card, clip, ctx| rename_dialog(card, clip, ctx.clone())));
-        add("delete", Box::new(|card, clip, ctx| delete_dialog(card, clip, ctx.clone())));
+        add(
+            "delete",
+            Box::new(|card, clip, ctx| {
+                let card = card.clone();
+                let ctx = ctx.clone();
+                glib::spawn_future_local(async move {
+                    delete_clip(card.upcast_ref(), &ctx.state, &ctx.toasts, &clip).await;
+                });
+            }),
+        );
 
         // Checkbox item: its state mirrors the clip's favorite flag when the menu opens.
         let favorite = gio::SimpleAction::new_stateful("favorite", None, &false.to_variant());
@@ -879,34 +888,76 @@ fn rename_dialog(card: &ClipCard, clip: ClipMeta, ctx: Rc<CardContext>) {
     });
 }
 
-fn delete_dialog(card: &ClipCard, clip: ClipMeta, ctx: Rc<CardContext>) {
-    let dialog = adw::AlertDialog::new(
-        Some("Move this clip to the trash?"),
-        Some(&clip.title),
-    );
+/// Ask, then move a clip to the trash. If its folder has no trash (tmpfs, some removable
+/// drives), offer to delete it permanently instead. Returns true once the clip is gone.
+pub async fn delete_clip(
+    parent: &gtk::Widget,
+    state: &State,
+    toasts: &adw::ToastOverlay,
+    clip: &ClipMeta,
+) -> bool {
+    let confirm = adw::AlertDialog::new(Some("Move this clip to the trash?"), Some(&clip.title));
     // The body is the clip title, which may come from an app's window class.
-    dialog.set_body_use_markup(false);
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("delete", "Move to trash");
-    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_close_response("cancel");
-    let card = card.clone();
-    glib::spawn_future_local(async move {
-        if dialog.choose_future(Some(&card)).await != "delete" {
-            return;
+    confirm.set_body_use_markup(false);
+    confirm.add_response("cancel", "Cancel");
+    confirm.add_response("delete", "Move to trash");
+    confirm.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    confirm.set_default_response(Some("cancel"));
+    confirm.set_close_response("cancel");
+    if confirm.choose_future(Some(parent)).await != "delete" {
+        return false;
+    }
+
+    let lib = state.library();
+    let id = clip.id.clone();
+    let result = gio::spawn_blocking(move || lib.delete(&id))
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("delete panicked")));
+    let err = match result {
+        Ok(()) => {
+            toasts.add_toast(util::toast("Moved to trash"));
+            state.library_changed();
+            return true;
         }
-        let lib = ctx.state.library();
-        let id = clip.id.clone();
-        let result = gio::spawn_blocking(move || lib.delete(&id))
-            .await
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("delete panicked")));
-        match result {
-            Ok(()) => {
-                ctx.toasts.add_toast(util::toast("Moved to trash"));
-                ctx.state.library_changed();
-            }
-            Err(e) => ctx.toasts.add_toast(util::toast(&format!("Couldn't delete: {e}"))),
+        Err(e) => e,
+    };
+    let Some(unavailable) = err.downcast_ref::<TrashUnavailable>() else {
+        toasts.add_toast(util::toast(&format!("Couldn't delete: {err}")));
+        return false;
+    };
+
+    eprintln!("clippr-gui: trash unavailable for {}: {}", unavailable.path.display(), unavailable.reason);
+    let fallback = adw::AlertDialog::new(
+        Some("Can't move this clip to the trash"),
+        Some(
+            "The folder it's in has no trash Clippr can use. \
+             Delete it permanently instead? This can't be undone.",
+        ),
+    );
+    fallback.set_body_use_markup(false);
+    fallback.add_response("cancel", "Keep clip");
+    fallback.add_response("delete", "Delete permanently");
+    fallback.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    fallback.set_default_response(Some("cancel"));
+    fallback.set_close_response("cancel");
+    if fallback.choose_future(Some(parent)).await != "delete" {
+        return false;
+    }
+
+    let lib = state.library();
+    let id = clip.id.clone();
+    let result = gio::spawn_blocking(move || lib.delete_permanently(&id))
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("delete panicked")));
+    match result {
+        Ok(()) => {
+            toasts.add_toast(util::toast("Clip deleted"));
+            state.library_changed();
+            true
         }
-    });
+        Err(e) => {
+            toasts.add_toast(util::toast(&format!("Couldn't delete: {e}")));
+            false
+        }
+    }
 }

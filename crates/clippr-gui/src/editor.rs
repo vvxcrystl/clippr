@@ -530,37 +530,12 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
         let media = media.clone();
         let delete = gio::SimpleAction::new("delete", None);
         delete.connect_activate(move |_, _| {
-            let dialog = adw::AlertDialog::new(
-                Some("Delete this clip?"),
-                Some("It will be moved to the trash."),
-            );
-            dialog.add_response("cancel", "Cancel");
-            dialog.add_response("delete", "Delete");
-            dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-            dialog.set_default_response(Some("cancel"));
-            dialog.set_close_response("cancel");
-            let state = state.clone();
-            let toasts = toasts.clone();
-            let page = page.clone();
-            let clip = clip.clone();
-            let media = media.clone();
+            media.set_playing(false);
+            let (state, toasts, page) = (state.clone(), toasts.clone(), page.clone());
+            let target = clip.borrow().clone();
             glib::spawn_future_local(async move {
-                if dialog.choose_future(Some(&page)).await != "delete" {
-                    return;
-                }
-                media.set_playing(false);
-                let lib = state.library();
-                let id = clip.borrow().id.clone();
-                let result = gio::spawn_blocking(move || lib.delete(&id))
-                    .await
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("delete panicked")));
-                match result {
-                    Ok(()) => {
-                        toasts.add_toast(util::toast("Moved to trash"));
-                        state.library_changed();
-                        pop(&page);
-                    }
-                    Err(e) => toasts.add_toast(util::toast(&format!("Couldn't delete: {e}"))),
+                if crate::library::delete_clip(page.upcast_ref(), &state, &toasts, &target).await {
+                    pop(&page);
                 }
             });
         });

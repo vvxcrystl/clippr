@@ -246,7 +246,7 @@ pub fn build(app: &adw::Application, state: &Rc<State>) -> adw::ApplicationWindo
             button.set_sensitive(false);
             glib::spawn_future_local(async move {
                 if let Err(e) = state.save_clip(Some(secs)).await {
-                    toasts.add_toast(adw::Toast::new(&format!("Couldn't save: {e}")));
+                    toasts.add_toast(util::toast(&format!("Couldn't save: {e}")));
                 }
                 button.set_sensitive(true);
             });
@@ -293,7 +293,7 @@ pub fn build(app: &adw::Application, state: &Rc<State>) -> adw::ApplicationWindo
                         saved_label.set_label("Renamed");
                         *last_clip.borrow_mut() = Some(clip);
                     }
-                    Err(e) => toasts.add_toast(adw::Toast::new(&format!("Couldn't rename: {e}"))),
+                    Err(e) => toasts.add_toast(util::toast(&format!("Couldn't rename: {e}"))),
                 }
             });
         });
@@ -313,7 +313,7 @@ pub fn build(app: &adw::Application, state: &Rc<State>) -> adw::ApplicationWindo
             let paused = b.is_active();
             glib::spawn_future_local(async move {
                 if let Err(e) = state.set_paused(paused).await {
-                    toasts.add_toast(adw::Toast::new(&format!("{e}")));
+                    toasts.add_toast(util::toast(&format!("{e}")));
                 }
             });
         });
@@ -328,7 +328,7 @@ pub fn build(app: &adw::Application, state: &Rc<State>) -> adw::ApplicationWindo
             let toasts = toasts.clone();
             glib::spawn_future_local(async move {
                 if let Err(e) = state.apply_config(cfg).await {
-                    toasts.add_toast(adw::Toast::new(&format!("{e}")));
+                    toasts.add_toast(util::toast(&format!("{e}")));
                 }
             });
         })

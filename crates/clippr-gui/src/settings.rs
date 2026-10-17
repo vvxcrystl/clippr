@@ -78,9 +78,9 @@ impl Editor {
         let this = self.clone();
         glib::spawn_future_local(async move {
             let toast = match this.state.apply_config(new).await {
-                Ok(()) if restarts => adw::Toast::new("Saved. The replay buffer restarted"),
-                Ok(()) => adw::Toast::new("Saved"),
-                Err(e) => adw::Toast::new(&format!("Couldn't save settings: {e}")),
+                Ok(()) if restarts => util::toast("Saved. The replay buffer restarted"),
+                Ok(()) => util::toast("Saved"),
+                Err(e) => util::toast(&format!("Couldn't save settings: {e}")),
             };
             toast.set_timeout(2);
             this.toasts.add_toast(toast);
@@ -434,7 +434,7 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay) -> gtk::Widget {
                     Ok(Response::Ok) | Ok(_) => "Pick a screen in the dialog that opens".to_string(),
                     Err(e) => format!("Couldn't reset: {e}"),
                 };
-                toasts.add_toast(adw::Toast::new(&msg));
+                toasts.add_toast(util::toast(&msg));
             });
         });
     }
@@ -451,7 +451,7 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay) -> gtk::Widget {
                 let toasts = toasts.clone();
                 glib::spawn_future_local(async move {
                     if let Err(e) = daemon::call(Request::Quit).await {
-                        toasts.add_toast(adw::Toast::new(&format!("{e}")));
+                        toasts.add_toast(util::toast(&format!("{e}")));
                     }
                 });
             } else {

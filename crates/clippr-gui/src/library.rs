@@ -185,13 +185,14 @@ pub fn build(
                 _ => "grid",
             });
             let cfg = state.config();
-            empty.set_description(Some(&format!(
+            // Status page descriptions are markup, and hotkeys like "<Super>F8" contain '<'.
+            empty.set_description(Some(&glib::markup_escape_text(&format!(
                 "Press {} to save the last {}, or {} for the last {}",
                 cfg.hotkeys.clip_short,
                 util::clip_length(cfg.general.clip_short_secs),
                 cfg.hotkeys.clip_long,
                 util::clip_length(cfg.general.clip_long_secs),
-            )));
+            ))));
             let bytes: u64 = (0..total)
                 .filter_map(|i| store.item(i).and_downcast::<glib::BoxedAnyObject>())
                 .map(|o| o.borrow::<ClipMeta>().size_bytes)
@@ -237,7 +238,7 @@ pub fn build(
                 let clips = match result {
                     Ok(clips) => clips,
                     Err(e) => {
-                        toasts.add_toast(adw::Toast::new(&format!("Couldn't read clips: {e}")));
+                        toasts.add_toast(util::toast(&format!("Couldn't read clips: {e}")));
                         Vec::new()
                     }
                 };
@@ -467,7 +468,7 @@ fn status_strip(state: &Rc<State>, toasts: &adw::ToastOverlay) -> gtk::Widget {
             let toasts = toasts.clone();
             glib::spawn_future_local(async move {
                 if let Err(e) = state.set_paused(!state.paused()).await {
-                    toasts.add_toast(adw::Toast::new(&format!("{e}")));
+                    toasts.add_toast(util::toast(&format!("{e}")));
                 }
             });
         });
@@ -484,8 +485,8 @@ fn status_strip(state: &Rc<State>, toasts: &adw::ToastOverlay) -> gtk::Widget {
             button.set_sensitive(false);
             glib::spawn_future_local(async move {
                 let toast = match state.save_clip(Some(secs)).await {
-                    Ok(clip) => adw::Toast::new(&format!("Saved \u{201c}{}\u{201d}", clip.title)),
-                    Err(e) => adw::Toast::new(&format!("Couldn't save clip: {e}")),
+                    Ok(clip) => util::toast(&format!("Saved \u{201c}{}\u{201d}", clip.title)),
+                    Err(e) => util::toast(&format!("Couldn't save clip: {e}")),
                 };
                 toasts.add_toast(toast);
                 button.set_sensitive(true);

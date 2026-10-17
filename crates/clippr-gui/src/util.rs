@@ -128,6 +128,14 @@ pub fn app_icon(app: &AppInfo) -> Option<gio::Icon> {
         .map(|name| gio::ThemedIcon::new(&name).upcast())
 }
 
+/// A toast that shows `text` literally. `AdwToast` parses Pango markup by default, and clip
+/// titles can come from app-chosen window classes, so markup must never be interpreted.
+pub fn toast(text: &str) -> adw::Toast {
+    let toast = adw::Toast::new(text);
+    toast.set_use_markup(false);
+    toast
+}
+
 /// Path of a sibling binary installed next to this one, or the bare name for a PATH lookup.
 pub fn sibling_exe(name: &str) -> PathBuf {
     std::env::current_exe()

@@ -308,7 +308,7 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
         let toasts = toasts.clone();
         move |media| {
             if let Some(err) = media.error() {
-                toasts.add_toast(adw::Toast::new(&format!("Can't play this clip: {err}")));
+                toasts.add_toast(util::toast(&format!("Can't play this clip: {err}")));
             }
         }
     });
@@ -457,7 +457,7 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
                         *clip.borrow_mut() = updated;
                         state.library_changed();
                     }
-                    Err(e) => toasts.add_toast(adw::Toast::new(&format!("Couldn't save: {e}"))),
+                    Err(e) => toasts.add_toast(util::toast(&format!("Couldn't save: {e}"))),
                 }
             });
         })
@@ -506,7 +506,7 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
             let file = gio::File::for_path(&path);
             let provider = gdk::ContentProvider::for_value(&file.to_value());
             if page.clipboard().set_content(Some(&provider)).is_ok() {
-                toasts.add_toast(adw::Toast::new("Copied clip file"));
+                toasts.add_toast(util::toast("Copied clip file"));
             }
         });
         actions.add_action(&copy);
@@ -569,11 +569,11 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("delete panicked")));
                 match result {
                     Ok(()) => {
-                        toasts.add_toast(adw::Toast::new("Moved to trash"));
+                        toasts.add_toast(util::toast("Moved to trash"));
                         state.library_changed();
                         pop(&page);
                     }
-                    Err(e) => toasts.add_toast(adw::Toast::new(&format!("Couldn't delete: {e}"))),
+                    Err(e) => toasts.add_toast(util::toast(&format!("Couldn't delete: {e}"))),
                 }
             });
         });
@@ -673,12 +673,12 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
                         match result {
                             Ok(new_clip) => {
                                 state.library_changed();
-                                let toast = adw::Toast::new(&format!("Saved \u{201c}{}\u{201d}", new_clip.title));
+                                let toast = util::toast(&format!("Saved \u{201c}{}\u{201d}", new_clip.title));
                                 toasts.add_toast(toast);
                                 pop(&page);
                             }
-                            Err(_) if cancelled => toasts.add_toast(adw::Toast::new("Export cancelled")),
-                            Err(e) => toasts.add_toast(adw::Toast::new(&format!("Export failed: {e}"))),
+                            Err(_) if cancelled => toasts.add_toast(util::toast("Export cancelled")),
+                            Err(e) => toasts.add_toast(util::toast(&format!("Export failed: {e}"))),
                         }
                     });
                 }

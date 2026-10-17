@@ -50,9 +50,17 @@ impl Kwin {
             .build()
             .await?;
         let plugin = "clippr-focus".to_owned();
-        let script = r#"function report(w) {
+        let script = r#"var active = null;
+function send() {
+    var w = active;
     callDBus('org.clippr.Daemon', '/org/clippr/Daemon', 'org.clippr.Daemon', 'FocusChanged',
         w ? String(w.resourceClass) : '', w ? String(w.caption) : '', w ? String(w.pid) : '0');
+}
+function report(w) {
+    if (active) { try { active.captionChanged.disconnect(send); } catch (e) {} }
+    active = w;
+    if (active) active.captionChanged.connect(send);
+    send();
 }
 workspace.windowActivated.connect(report);
 report(workspace.activeWindow);

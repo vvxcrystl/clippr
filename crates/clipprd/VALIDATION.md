@@ -38,7 +38,9 @@ encoder: vah264enc, 10,000 kbps, no B-frames
 
 PipeWire links verified the audio stream connected to the default **Audio/Sink**
 monitor, rather than the microphone. KWin event callbacks populated the actual
-focused app, PID and title. Host portal registration and GlobalShortcuts binding
+focused app, PID and title. The script also connects the active window
+caption-change signal, so the cache stays current without polling or a focus
+switch; the updated script loaded successfully in the live KWin session. Host portal registration and GlobalShortcuts binding
 both succeeded after supplying an executable desktop identity. A separate live
 mic-plus-desktop test verified both Audio/Source and Audio/Sink input links and
 saved a 1.9355-second H.264/AAC MP4 through the mixer. Its optional notification

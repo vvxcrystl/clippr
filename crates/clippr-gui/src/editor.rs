@@ -502,10 +502,7 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
         let page = page.clone();
         let copy = gio::SimpleAction::new("copy", None);
         copy.connect_activate(move |_, _| {
-            // Offered as a file, so it pastes into chat apps and file managers as an attachment.
-            let file = gio::File::for_path(&path);
-            let provider = gdk::ContentProvider::for_value(&file.to_value());
-            if page.clipboard().set_content(Some(&provider)).is_ok() {
+            if util::copy_file(&page, &path) {
                 toasts.add_toast(util::toast("Copied clip file"));
             }
         });
@@ -515,24 +512,14 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
         let path = video_path.clone();
         let page = page.clone();
         let open = gio::SimpleAction::new("open", None);
-        open.connect_activate(move |_, _| {
-            let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&path)));
-            launcher.launch(page.root().and_downcast_ref::<gtk::Window>(), gio::Cancellable::NONE, |_| {});
-        });
+        open.connect_activate(move |_, _| util::open_file(&page, &path));
         actions.add_action(&open);
     }
     {
         let path = video_path.clone();
         let page = page.clone();
         let folder = gio::SimpleAction::new("folder", None);
-        folder.connect_activate(move |_, _| {
-            let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&path)));
-            launcher.open_containing_folder(
-                page.root().and_downcast_ref::<gtk::Window>(),
-                gio::Cancellable::NONE,
-                |_| {},
-            );
-        });
+        folder.connect_activate(move |_, _| util::show_in_folder(&page, &path));
         actions.add_action(&folder);
     }
     {

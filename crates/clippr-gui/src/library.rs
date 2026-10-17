@@ -89,9 +89,16 @@ pub fn build(
 
     let thumbs = Thumbnailer::new();
     let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
+    let menu_ctx = Rc::new(CardContext {
+        state: state.clone(),
+        toasts: toasts.clone(),
+        open_editor: open_editor.clone(),
+    });
+    factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().expect("list item");
-        item.set_child(Some(&ClipCard::default()));
+        let card = ClipCard::default();
+        card.install_menu(menu_ctx.clone());
+        item.set_child(Some(&card));
     });
     {
         let thumbs = thumbs.clone();
@@ -102,6 +109,19 @@ pub fn build(
             let obj = item.item().and_downcast::<glib::BoxedAnyObject>().expect("clip item");
             let clip = obj.borrow::<ClipMeta>().clone();
             card.bind(&clip, &thumbs, state.config().general.clips_dir);
+
+            // Debug builds: CLIPPR_GUI_OPEN_MENU opens the first card's menu for layout checks.
+            #[cfg(debug_assertions)]
+            if item.position() == 0 && std::env::var_os("CLIPPR_GUI_OPEN_MENU").is_some() {
+                let card = card.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(1200), move || {
+                    // Wayland drops grabbing popups that no real input event triggered.
+                    if let Some(menu) = card.imp().menu.borrow().as_ref() {
+                        menu.set_autohide(false);
+                    }
+                    card.popup_menu(40.0, 40.0)
+                });
+            }
         });
     }
 
@@ -561,6 +581,9 @@ mod imp {
         pub title: gtk::Label,
         pub subtitle: gtk::Label,
         pub bound_id: RefCell<String>,
+        pub clip: RefCell<Option<ClipMeta>>,
+        pub menu: RefCell<Option<gtk::PopoverMenu>>,
+        pub actions: RefCell<Option<gio::SimpleActionGroup>>,
     }
 
     #[glib::object_subclass]
@@ -571,6 +594,13 @@ mod imp {
     }
 
     impl ObjectImpl for ClipCard {
+        fn dispose(&self) {
+            // Popovers parented with set_parent must be unparented by hand.
+            if let Some(menu) = self.menu.take() {
+                menu.unparent();
+            }
+        }
+
         fn constructed(&self) {
             self.parent_constructed();
             let obj = self.obj();
@@ -645,6 +675,7 @@ impl ClipCard {
     fn bind(&self, clip: &ClipMeta, thumbs: &Thumbnailer, dir: PathBuf) {
         let imp = self.imp();
         *imp.bound_id.borrow_mut() = clip.id.clone();
+        *imp.clip.borrow_mut() = Some(clip.clone());
         imp.title.set_label(&clip.title);
         imp.title.set_tooltip_text(Some(&clip.title));
         imp.duration.set_label(&util::duration(clip.duration_secs));
@@ -675,4 +706,207 @@ impl ClipCard {
             }
         });
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Card context menu
+
+type CardAction = Box<dyn Fn(&ClipCard, ClipMeta, &Rc<CardContext>)>;
+
+/// What a card's context menu needs from the page around it.
+struct CardContext {
+    state: Rc<State>,
+    toasts: adw::ToastOverlay,
+    open_editor: Rc<dyn Fn(ClipMeta)>,
+}
+
+impl CardContext {
+    /// Write a sidecar change, then refresh the library.
+    fn update(self: &Rc<Self>, clip: ClipMeta) {
+        let lib = self.state.library();
+        let ctx = self.clone();
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || lib.update(&clip))
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("writer panicked")));
+            match result {
+                Ok(()) => ctx.state.library_changed(),
+                Err(e) => ctx.toasts.add_toast(util::toast(&format!("Couldn't save: {e}"))),
+            }
+        });
+    }
+}
+
+impl ClipCard {
+    fn install_menu(&self, ctx: Rc<CardContext>) {
+        let open = gio::Menu::new();
+        open.append(Some("Open in editor"), Some("card.edit"));
+        open.append(Some("Play in video player"), Some("card.play"));
+        let manage = gio::Menu::new();
+        manage.append(Some("Rename\u{2026}"), Some("card.rename"));
+        manage.append(Some("Favorite"), Some("card.favorite"));
+        manage.append(Some("Copy file"), Some("card.copy"));
+        manage.append(Some("Show in folder"), Some("card.folder"));
+        let danger = gio::Menu::new();
+        danger.append(Some("Move to trash"), Some("card.delete"));
+        let model = gio::Menu::new();
+        model.append_section(None, &open);
+        model.append_section(None, &manage);
+        model.append_section(None, &danger);
+
+        let menu = gtk::PopoverMenu::from_model(Some(&model));
+        menu.set_parent(self);
+        menu.set_has_arrow(false);
+        menu.set_halign(gtk::Align::Start);
+        *self.imp().menu.borrow_mut() = Some(menu);
+
+        let actions = gio::SimpleActionGroup::new();
+        let add = |name: &str, f: CardAction| {
+            let action = gio::SimpleAction::new(name, None);
+            let card = self.downgrade();
+            let ctx = ctx.clone();
+            action.connect_activate(move |_, _| {
+                let Some(card) = card.upgrade() else { return };
+                let Some(clip) = card.imp().clip.borrow().clone() else { return };
+                f(&card, clip, &ctx);
+            });
+            actions.add_action(&action);
+        };
+        add("edit", Box::new(|_, clip, ctx| (ctx.open_editor)(clip)));
+        add(
+            "play",
+            Box::new(|card, clip, ctx| util::open_file(card, &ctx.state.library().video_path(&clip))),
+        );
+        add(
+            "folder",
+            Box::new(|card, clip, ctx| util::show_in_folder(card, &ctx.state.library().video_path(&clip))),
+        );
+        add(
+            "copy",
+            Box::new(|card, clip, ctx| {
+                if util::copy_file(card, &ctx.state.library().video_path(&clip)) {
+                    ctx.toasts.add_toast(util::toast("Copied clip file"));
+                }
+            }),
+        );
+        add("rename", Box::new(|card, clip, ctx| rename_dialog(card, clip, ctx.clone())));
+        add("delete", Box::new(|card, clip, ctx| delete_dialog(card, clip, ctx.clone())));
+
+        // Checkbox item: its state mirrors the clip's favorite flag when the menu opens.
+        let favorite = gio::SimpleAction::new_stateful("favorite", None, &false.to_variant());
+        {
+            let card = self.downgrade();
+            let ctx = ctx.clone();
+            favorite.connect_activate(move |action, _| {
+                let Some(card) = card.upgrade() else { return };
+                let Some(mut clip) = card.imp().clip.borrow().clone() else { return };
+                clip.favorite = !clip.favorite;
+                action.set_state(&clip.favorite.to_variant());
+                ctx.update(clip);
+            });
+        }
+        actions.add_action(&favorite);
+
+        self.insert_action_group("card", Some(&actions));
+        *self.imp().actions.borrow_mut() = Some(actions);
+
+        let right_click = gtk::GestureClick::builder().button(gdk::BUTTON_SECONDARY).build();
+        {
+            let card = self.downgrade();
+            right_click.connect_pressed(move |gesture, _, x, y| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                if let Some(card) = card.upgrade() {
+                    card.popup_menu(x, y);
+                }
+            });
+        }
+        self.add_controller(right_click);
+
+        let long_press = gtk::GestureLongPress::builder().touch_only(true).build();
+        {
+            let card = self.downgrade();
+            long_press.connect_pressed(move |gesture, x, y| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                if let Some(card) = card.upgrade() {
+                    card.popup_menu(x, y);
+                }
+            });
+        }
+        self.add_controller(long_press);
+    }
+
+    fn popup_menu(&self, x: f64, y: f64) {
+        let imp = self.imp();
+        let favorite = imp.clip.borrow().as_ref().is_some_and(|c| c.favorite);
+        if let Some(action) = imp
+            .actions
+            .borrow()
+            .as_ref()
+            .and_then(|a| a.lookup_action("favorite"))
+            .and_downcast::<gio::SimpleAction>()
+        {
+            action.set_state(&favorite.to_variant());
+        }
+        if let Some(menu) = imp.menu.borrow().as_ref() {
+            menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            menu.popup();
+        }
+    }
+}
+
+fn rename_dialog(card: &ClipCard, clip: ClipMeta, ctx: Rc<CardContext>) {
+    let entry = gtk::Entry::builder().text(&clip.title).activates_default(true).build();
+    entry.connect_map(|e| {
+        e.grab_focus();
+    });
+    let dialog = adw::AlertDialog::new(Some("Rename clip"), None);
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("rename", "Rename");
+    dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("rename"));
+    dialog.set_close_response("cancel");
+    dialog.set_extra_child(Some(&entry));
+    let card = card.clone();
+    glib::spawn_future_local(async move {
+        if dialog.choose_future(Some(&card)).await != "rename" {
+            return;
+        }
+        let title = entry.text().trim().to_string();
+        if title.is_empty() || title == clip.title {
+            return;
+        }
+        ctx.update(ClipMeta { title, ..clip });
+    });
+}
+
+fn delete_dialog(card: &ClipCard, clip: ClipMeta, ctx: Rc<CardContext>) {
+    let dialog = adw::AlertDialog::new(
+        Some("Move this clip to the trash?"),
+        Some(&clip.title),
+    );
+    // The body is the clip title, which may come from an app's window class.
+    dialog.set_body_use_markup(false);
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("delete", "Move to trash");
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let card = card.clone();
+    glib::spawn_future_local(async move {
+        if dialog.choose_future(Some(&card)).await != "delete" {
+            return;
+        }
+        let lib = ctx.state.library();
+        let id = clip.id.clone();
+        let result = gio::spawn_blocking(move || lib.delete(&id))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("delete panicked")));
+        match result {
+            Ok(()) => {
+                ctx.toasts.add_toast(util::toast("Moved to trash"));
+                ctx.state.library_changed();
+            }
+            Err(e) => ctx.toasts.add_toast(util::toast(&format!("Couldn't delete: {e}"))),
+        }
+    });
 }

@@ -618,6 +618,15 @@ fn overlay_command(
     command
 }
 
+
+
+// A poisoned mutex still contains valid packet history; errors must not abort capture.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,11 +643,4 @@ mod tests {
             assert_eq!(env[std::ffi::OsStr::new("DESKTOP_STARTUP_ID")], None);
         }
     }
-}
-
-// A poisoned mutex still contains valid packet history; errors must not abort capture.
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

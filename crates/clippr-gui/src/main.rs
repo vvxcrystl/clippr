@@ -103,7 +103,8 @@ fn present(app: &adw::Application, mode: Mode) {
 }
 
 /// Debug builds only: `CLIPPR_GUI_SNAPSHOT=out.png` renders the active window to a PNG after
-/// a short delay, and `CLIPPR_GUI_OPEN_CLIP=<id>` opens that clip in the editor first.
+/// a short delay (`CLIPPR_GUI_SNAPSHOT_DELAY_MS`, default 2500), and `CLIPPR_GUI_OPEN_CLIP=<id>`
+/// opens that clip in the editor first.
 /// Used to check layouts on compositors that don't allow per-window screenshots.
 #[cfg(debug_assertions)]
 mod debug_snapshot {
@@ -112,7 +113,11 @@ mod debug_snapshot {
     pub fn schedule(app: &adw::Application) {
         let Ok(path) = std::env::var("CLIPPR_GUI_SNAPSHOT") else { return };
         let app = app.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(2500), move || {
+        let delay = std::env::var("CLIPPR_GUI_SNAPSHOT_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2500);
+        glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
             let Some(win) = app.active_window() else { return };
             let (w, h) = (win.width() as f64, win.height() as f64);
             let paintable = gtk::WidgetPaintable::new(Some(&win));
@@ -125,7 +130,33 @@ mod debug_snapshot {
                 eprintln!("snapshot failed: {e}");
             }
             eprintln!("snapshot written to {path}");
+            // Popovers are separate surfaces, so render any open one to `<path>.popover.png`.
+            if let Some(popover) = find_open_popover(win.upcast_ref()) {
+                let (w, h) = (popover.width() as f64, popover.height() as f64);
+                let paintable = gtk::WidgetPaintable::new(Some(&popover));
+                let snapshot = gtk::Snapshot::new();
+                paintable.snapshot(&snapshot, w, h);
+                if let (Some(node), Some(renderer)) = (snapshot.to_node(), popover.renderer()) {
+                    let _ = renderer.render_texture(&node, None).save_to_png(format!("{path}.popover.png"));
+                }
+            }
         });
+    }
+
+    fn find_open_popover(widget: &gtk::Widget) -> Option<gtk::Popover> {
+        if let Some(p) = widget.downcast_ref::<gtk::Popover>() {
+            if p.is_visible() {
+                return Some(p.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            if let Some(found) = find_open_popover(&c) {
+                return Some(found);
+            }
+            child = c.next_sibling();
+        }
+        None
     }
 }
 

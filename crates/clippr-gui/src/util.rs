@@ -136,6 +136,30 @@ pub fn toast(text: &str) -> adw::Toast {
     toast
 }
 
+/// Put a clip on the clipboard as a file, so it pastes into chat apps and file managers as an
+/// attachment. Returns false if the clipboard refused it.
+pub fn copy_file(widget: &impl IsA<gtk::Widget>, path: &std::path::Path) -> bool {
+    let file = gio::File::for_path(path);
+    let provider = gtk::gdk::ContentProvider::for_value(&file.to_value());
+    widget.clipboard().set_content(Some(&provider)).is_ok()
+}
+
+/// Open a file in the user's default app for it.
+pub fn open_file(widget: &impl IsA<gtk::Widget>, path: &std::path::Path) {
+    let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
+    launcher.launch(widget.root().and_downcast_ref::<gtk::Window>(), gio::Cancellable::NONE, |_| {});
+}
+
+/// Open the file manager with the file selected.
+pub fn show_in_folder(widget: &impl IsA<gtk::Widget>, path: &std::path::Path) {
+    let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
+    launcher.open_containing_folder(
+        widget.root().and_downcast_ref::<gtk::Window>(),
+        gio::Cancellable::NONE,
+        |_| {},
+    );
+}
+
 /// Path of a sibling binary installed next to this one, or the bare name for a PATH lookup.
 pub fn sibling_exe(name: &str) -> PathBuf {
     std::env::current_exe()

@@ -18,4 +18,12 @@ for desktop in packaging/*.desktop; do
     install -d "$HOME/.local/share/applications"
     install -m 644 "$desktop" "$HOME/.local/share/applications/"
 done
+install -d "$HOME/.local/share/icons/hicolor/scalable/apps"
+install -m 644 assets/icon.svg "$HOME/.local/share/icons/hicolor/scalable/apps/dev.clippr.Clippr.svg"
+if command -v update-desktop-database >/dev/null; then
+    update-desktop-database "$HOME/.local/share/applications" || true
+fi
+if command -v gtk-update-icon-cache >/dev/null; then
+    gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" || true
+fi
 printf '%s\n' 'Installed clippr into ~/.local/bin. Ensure it is on PATH.' 'Enable capture with: systemctl --user enable --now clipprd'

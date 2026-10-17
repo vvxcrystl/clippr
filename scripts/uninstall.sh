@@ -7,5 +7,12 @@ for desktop in "$repo_dir"/packaging/*.desktop; do
     [[ -f "$desktop" ]] || continue
     rm -f -- "$HOME/.local/share/applications/$(basename -- "$desktop")"
 done
+rm -f -- "$HOME/.local/share/icons/hicolor/scalable/apps/dev.clippr.Clippr.svg"
+if command -v update-desktop-database >/dev/null; then
+    update-desktop-database "$HOME/.local/share/applications" || true
+fi
+if command -v gtk-update-icon-cache >/dev/null; then
+    gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" || true
+fi
 if command -v systemctl >/dev/null; then systemctl --user daemon-reload 2>/dev/null || true; fi
 printf '%s\n' 'Uninstalled clippr. Clips, configuration, and cached data were preserved.'

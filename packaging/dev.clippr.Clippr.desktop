@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Clippr
+Comment=Replay buffer screen clipper
+Exec=clippr-gui
+Icon=dev.clippr.Clippr
+Categories=AudioVideo;Video;Recorder;
+Terminal=false

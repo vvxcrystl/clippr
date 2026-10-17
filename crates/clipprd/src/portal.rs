@@ -2,15 +2,18 @@ use std::{os::fd::OwnedFd, os::unix::fs::OpenOptionsExt};
 
 use anyhow::{Context, Result};
 use ashpd::desktop::{
-    PersistMode, Session, SessionPortal,
     global_shortcuts::{GlobalShortcuts, NewShortcut},
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
+    PersistMode, Session, SessionPortal,
 };
 use clippr_core::{config::Config, paths};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::Message;
+
+// The library desktop entry also gives the host daemon its portal identity.
+const APP_ID: &str = "dev.clippr.Clippr";
 
 pub struct ManagedSession<T: SessionPortal + Send + Sync + 'static>(std::sync::Arc<Session<T>>);
 impl<T: SessionPortal + Send + Sync + 'static> std::ops::Deref for ManagedSession<T> {
@@ -150,12 +153,12 @@ pub fn prepare_identity() -> Result<()> {
             std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
         })
         .context("no user data directory")?;
-    let relative = "applications/dev.clippr.Clippr.desktop";
-    let installed = data_home.join(relative).exists()
+    let relative = format!("applications/{APP_ID}.desktop");
+    let installed = data_home.join(&relative).exists()
         || std::env::var("XDG_DATA_DIRS")
             .unwrap_or_else(|_| "/usr/local/share:/usr/share".into())
             .split(':')
-            .any(|root| std::path::Path::new(root).join(relative).exists());
+            .any(|root| std::path::Path::new(root).join(&relative).exists());
     if !installed {
         let path = data_home.join(relative);
         std::fs::create_dir_all(data_home.join("applications"))?;
@@ -172,9 +175,12 @@ pub fn prepare_identity() -> Result<()> {
                     .replace('"', "\\\"")
                     .replace('`', "\\`")
                     .replace('$', "\\$");
-                let desktop = include_str!("../dev.clippr.Clippr.desktop")
-                    .replace("Exec=clipprd", &format!("Exec=\"{executable}\""));
+                // A standalone daemon may have no GUI binary. Reuse the packaged
+                // identity, but hide it and give the portal an existing executable.
+                let desktop = include_str!("../../../packaging/dev.clippr.Clippr.desktop")
+                    .replace("Exec=clippr-gui", &format!("Exec=\"{executable}\""));
                 file.write_all(desktop.as_bytes())?;
+                file.write_all(b"NoDisplay=true\n")?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
             Err(e) => return Err(e.into()),
@@ -188,8 +194,7 @@ async fn connection() -> Result<zbus::Connection> {
     // A fresh portal connection also recovers registration after a portal restart.
     // Older portals lack Registry; ScreenCast still works without it there.
     if let Err(error) =
-        ashpd::register_host_app_with_connection(connection.clone(), "dev.clippr.Clippr".parse()?)
-            .await
+        ashpd::register_host_app_with_connection(connection.clone(), APP_ID.parse()?).await
     {
         tracing::debug!(%error, "portal host registration unavailable");
     }

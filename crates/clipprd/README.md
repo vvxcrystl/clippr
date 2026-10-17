@@ -19,7 +19,10 @@ stored in `$XDG_STATE_HOME/clippr/restore_token` with mode 0600. GlobalShortcuts
 binds `clip-short`, `clip-long`, and `toggle-overlay`. Modern portals need a
 matching desktop identity; when no packaged `dev.clippr.Clippr.desktop` exists,
 the daemon creates a hidden entry in the user's applications directory. An
-installed GUI desktop entry takes precedence. If shortcuts are unavailable, bind
+installed GUI desktop entry takes precedence. `packaging/dev.clippr.Clippr.desktop`
+serves both the library launcher and the daemon's explicitly registered portal app
+ID, `dev.clippr.Clippr`, including when launched by systemd. No second desktop
+identity is needed. If shortcuts are unavailable, bind
 `clippr save` / `clippr overlay` in the compositor.
 
 `general.start_recording=false` starts paused. Pausing destroys the pipeline.

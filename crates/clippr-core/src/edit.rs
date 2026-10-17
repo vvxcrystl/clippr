@@ -1,42 +1,354 @@
-//! Clip trimming and cutting.
-//!
-//! OWNER: backend (library agent). Signatures are the contract the GUI codes against.
-
-use std::sync::atomic::AtomicBool;
-
-use serde::{Deserialize, Serialize};
-
+//! Clip trimming and cutting with cancellable ffmpeg exports.
 use crate::clip::ClipMeta;
-use crate::library::Library;
+use crate::library::{probe, Library};
+use anyhow::{ensure, Context};
+use serde::{Deserialize, Serialize};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
+use std::time::Duration;
 
-/// A time range of the source clip to keep, in seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// A time range of the source clip to keep, in seconds.
 pub struct Segment {
     pub start_secs: f64,
     pub end_secs: f64,
 }
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExportRequest {
     pub source_id: String,
-    /// Ranges to keep, in output order. Gaps between them are cut out.
+    /// Ranges to keep, in output order.
     pub keep: Vec<Segment>,
     pub title: String,
-    /// `true` re-encodes for frame-accurate cuts. `false` copies streams and snaps cut
-    /// points to the nearest keyframe, which is near-instant.
+    /// Re-encode for frame-accurate cuts; otherwise copy streams at keyframes.
     pub precise: bool,
-    /// Replace the source clip instead of writing a new one.
+    /// Replace the source video and metadata while retaining its id.
     pub replace_source: bool,
 }
 
-/// Write the edited clip into the library and return its metadata.
-/// `progress` receives values in `0.0..=1.0`. Setting `cancel` aborts and removes partial output.
+/// Export kept ranges. Progress stays in 0..=1; cancellation removes temporary output.
 pub fn export(
     lib: &Library,
     req: &ExportRequest,
     progress: &mut dyn FnMut(f32),
     cancel: &AtomicBool,
 ) -> anyhow::Result<ClipMeta> {
-    let _ = (lib, req, progress, cancel);
-    todo!()
+    ensure!(!cancel.load(Ordering::Relaxed), "export cancelled");
+    let source = lib.get(&req.source_id)?;
+    let input = lib.checked_video_path(&source)?;
+    ensure!(
+        source.duration_secs.is_finite() && source.duration_secs > 0.0,
+        "invalid source duration"
+    );
+    let segments: Vec<_> = req
+        .keep
+        .iter()
+        .filter_map(|s| {
+            if !s.start_secs.is_finite() || !s.end_secs.is_finite() {
+                return None;
+            }
+            let start_secs = s.start_secs.clamp(0.0, source.duration_secs);
+            let end_secs = s.end_secs.clamp(0.0, source.duration_secs);
+            (end_secs > start_secs).then_some(Segment {
+                start_secs,
+                end_secs,
+            })
+        })
+        .collect();
+    ensure!(!segments.is_empty(), "no nonempty segments to export");
+    let total: f64 = segments.iter().map(|s| s.end_secs - s.start_secs).sum();
+    let work = tempfile::tempdir_in(lib.dir())?;
+    let output = work.path().join(
+        if req.replace_source && input.extension().is_some_and(|e| e == "mkv") {
+            "output.mkv"
+        } else {
+            "output.mp4"
+        },
+    );
+    progress(0.0);
+    if req.precise {
+        let result = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "json",
+            ])
+            .arg(&input)
+            .output()?;
+        ensure!(result.status.success(), "cannot probe audio streams");
+        let audio = !serde_json::from_slice::<serde_json::Value>(&result.stdout)?["streams"]
+            .as_array()
+            .context("invalid audio probe")?
+            .is_empty();
+        for hardware in [true, false] {
+            let mut filter = String::new();
+            let mut labels = String::new();
+            for (i, s) in segments.iter().enumerate() {
+                filter.push_str(&format!(
+                    "[0:v:0]trim=start={}:end={},setpts=PTS-STARTPTS[v{i}];",
+                    s.start_secs, s.end_secs
+                ));
+                labels.push_str(&format!("[v{i}]"));
+                if audio {
+                    filter.push_str(&format!(
+                        "[0:a:0]atrim=start={}:end={},asetpts=PTS-STARTPTS[a{i}];",
+                        s.start_secs, s.end_secs
+                    ));
+                    labels.push_str(&format!("[a{i}]"));
+                }
+            }
+            filter.push_str(&format!(
+                "{labels}concat=n={}:v=1:a={}[base]{};[base]{}[v]",
+                segments.len(),
+                usize::from(audio),
+                if audio { "[a]" } else { "" },
+                if hardware {
+                    "format=nv12,hwupload"
+                } else {
+                    "format=yuv420p"
+                }
+            ));
+            let mut cmd = ffmpeg();
+            if hardware {
+                cmd.args(["-vaapi_device", "/dev/dri/renderD128"]);
+            }
+            cmd.arg("-i")
+                .arg(&input)
+                .args(["-filter_complex", &filter, "-map", "[v]"]);
+            if audio {
+                cmd.args(["-map", "[a]", "-c:a", "aac", "-b:a", "160k"]);
+            }
+            if hardware {
+                cmd.args(["-c:v", "h264_vaapi"]);
+            } else {
+                cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]);
+            }
+            cmd.args(["-movflags", "+faststart"]).arg(&output);
+            match run(cmd, total, progress, cancel) {
+                Ok(()) => break,
+                Err(e) if hardware && !cancel.load(Ordering::Relaxed) => {
+                    eprintln!("clippr: VAAPI export failed, using libx264: {e:#}");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    } else {
+        let mut manifest = std::fs::File::create(work.path().join("concat.txt"))?;
+        let mut elapsed = 0.0;
+        for (i, s) in segments.iter().enumerate() {
+            let name = format!("segment{i}.mp4");
+            let duration = s.end_secs - s.start_secs;
+            let mut cmd = ffmpeg();
+            cmd.arg("-ss")
+                .arg(s.start_secs.to_string())
+                .arg("-i")
+                .arg(&input)
+                .arg("-t")
+                .arg(duration.to_string())
+                .args([
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "0:a:0?",
+                    "-c",
+                    "copy",
+                    "-avoid_negative_ts",
+                    "make_zero",
+                ])
+                .arg(work.path().join(&name));
+            run(
+                cmd,
+                duration,
+                &mut |p| progress(((elapsed + f64::from(p) * duration) / total * 0.8) as f32),
+                cancel,
+            )?;
+            elapsed += duration;
+            writeln!(manifest, "file '{name}'")?;
+        }
+        drop(manifest);
+        let mut cmd = ffmpeg();
+        cmd.args(["-f", "concat", "-safe", "1", "-i"])
+            .arg(work.path().join("concat.txt"))
+            .args(["-c", "copy", "-movflags", "+faststart"])
+            .arg(&output);
+        run(cmd, total, &mut |p| progress(0.8 + p * 0.2), cancel)?;
+    }
+    ensure!(!cancel.load(Ordering::Relaxed), "export cancelled");
+    let id = if req.replace_source {
+        source.id.clone()
+    } else {
+        let base = format!("{}_edit", source.id);
+        let mut candidate = base.clone();
+        let mut suffix = 2;
+        loop {
+            ensure!(
+                crate::clip::is_valid_id(&candidate),
+                "edited clip id exceeds maximum length"
+            );
+            if !lib.dir().join(format!("{candidate}.json")).exists()
+                && !lib.dir().join(format!("{candidate}.mp4")).exists()
+                && !lib.dir().join(format!("{candidate}.mkv")).exists()
+            {
+                break candidate;
+            }
+            candidate = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+    };
+    let mut clip = probe(&output, &id)?;
+    clip.title = req.title.clone();
+    clip.app = source.app.clone();
+    clip.tags = source.tags.clone();
+    clip.favorite = source.favorite;
+    clip.edited_from = Some(source.id.clone());
+    let destination = if req.replace_source {
+        input
+    } else {
+        lib.dir().join(format!("{id}.mp4"))
+    };
+    clip.file = destination
+        .file_name()
+        .context("missing filename")?
+        .to_str()
+        .context("non UTF8 filename")?
+        .into();
+    if req.replace_source {
+        clip.created_at = source.created_at;
+    }
+    ensure!(!cancel.load(Ordering::Relaxed), "export cancelled");
+    // Back up a replaced source until its sidecar is committed, allowing rollback on failure.
+    let backup = work.path().join("original");
+    if req.replace_source {
+        std::fs::hard_link(&destination, &backup)?;
+    }
+    if req.replace_source {
+        std::fs::rename(&output, &destination)?;
+    } else {
+        std::fs::hard_link(&output, &destination)?;
+    }
+    if let Err(e) = lib.update(&clip) {
+        if req.replace_source {
+            std::fs::rename(backup, &destination)?;
+        } else {
+            let _ = std::fs::remove_file(&destination);
+        }
+        return Err(e);
+    }
+    progress(1.0);
+    Ok(clip)
+}
+
+fn ffmpeg() -> Command {
+    let mut cmd = Command::new("nice");
+    cmd.args([
+        "-n",
+        "10",
+        "ffmpeg",
+        "-nostdin",
+        "-v",
+        "error",
+        "-y",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+    ]);
+    cmd
+}
+
+fn run(
+    mut cmd: Command,
+    total: f64,
+    progress: &mut dyn FnMut(f32),
+    cancel: &AtomicBool,
+) -> anyhow::Result<()> {
+    ensure!(!cancel.load(Ordering::Relaxed), "export cancelled");
+    let mut errors = tempfile::tempfile()?;
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(errors.try_clone()?)
+        .spawn()
+        .context("starting ffmpeg")?;
+    let stdout = child.stdout.take().context("missing progress pipe")?;
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(time) = line
+                .strip_prefix("out_time_us=")
+                .and_then(|s| s.parse::<f64>().ok())
+            {
+                if tx.send(time).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let status = loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            anyhow::bail!("export cancelled");
+        }
+        for time in rx.try_iter() {
+            progress((time / 1_000_000.0 / total).clamp(0.0, 0.99) as f32);
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let _ = reader.join();
+    if !status.success() {
+        use std::io::{Seek, SeekFrom};
+        errors.seek(SeekFrom::Start(0))?;
+        let mut message = String::new();
+        errors.read_to_string(&mut message)?;
+        anyhow::bail!("ffmpeg failed: {message}");
+    }
+    progress(1.0);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cancellation_kills_running_ffmpeg() -> anyhow::Result<()> {
+        let cancel = AtomicBool::new(false);
+        let mut cmd = ffmpeg();
+        cmd.args([
+            "-re",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x64:rate=10",
+            "-t",
+            "60",
+            "-f",
+            "null",
+            "-",
+        ]);
+        let started = std::time::Instant::now();
+        let result = run(
+            cmd,
+            60.0,
+            &mut |p| {
+                if p > 0.0 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+            &cancel,
+        );
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        Ok(())
+    }
 }

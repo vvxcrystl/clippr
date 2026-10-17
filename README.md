@@ -85,3 +85,7 @@ cargo clippy --workspace
 ```
 
 See [AGENTS.md](AGENTS.md) for conventions.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

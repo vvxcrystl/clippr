@@ -4,12 +4,32 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use crate::clip::{is_valid_id, ClipMeta};
 use anyhow::{bail, ensure, Context};
+
+/// No supported trash location could accept this clip. Callers may offer permanent deletion.
+#[derive(Debug)]
+pub struct TrashUnavailable {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+impl std::fmt::Display for TrashUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "can't move {} to the trash: {}",
+            self.path.display(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for TrashUnavailable {}
 
 pub struct Library {
     dir: PathBuf,
@@ -114,20 +134,23 @@ impl Library {
 
     pub fn checked_video_path(&self, clip: &ClipMeta) -> anyhow::Result<PathBuf> {
         ensure!(is_valid_id(&clip.id), "invalid clip id");
-        let mut parts = Path::new(&clip.file).components();
+        self.checked_video_filename(&clip.file)
+    }
+
+    fn checked_video_filename(&self, filename: &str) -> anyhow::Result<PathBuf> {
+        let mut parts = Path::new(filename).components();
         ensure!(
             matches!(parts.next(), Some(Component::Normal(_)))
                 && parts.next().is_none()
-                && !clip.file.contains('/')
-                && !clip.file.contains('\\'),
+                && !filename.contains('/')
+                && !filename.contains('\\'),
             "invalid video filename"
         );
-        let path = self.dir.join(&clip.file);
-        if let Ok(meta) = fs::symlink_metadata(&path) {
-            ensure!(
-                meta.is_file() && !meta.file_type().is_symlink(),
-                "video is not a regular file"
-            );
+        let path = self.dir.join(filename);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) => ensure!(meta.is_file(), "video is not a regular file"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
         }
         Ok(path)
     }
@@ -144,14 +167,48 @@ impl Library {
 
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
         let clip = self.get(id)?;
-        trash(&self.checked_video_path(&clip)?)?;
-        trash(&self.dir.join(format!("{id}.json")))?;
-        match fs::remove_file(crate::paths::thumbs_dir().join(format!("{id}.jpg"))) {
-            Ok(()) => (),
+        let video = self.checked_video_path(&clip)?;
+        let sidecar = self.dir.join(format!("{id}.json"));
+        trash_pair(&video, &sidecar)?;
+        remove_if_present(&crate::paths::thumbs_dir().join(format!("{id}.jpg")))
+    }
+
+    /// Permanently remove a clip, including an orphaned video or sidecar.
+    /// Symlinked sidecars are unlinked without reading their targets.
+    pub fn delete_permanently(&self, id: &str) -> anyhow::Result<()> {
+        ensure!(is_valid_id(id), "invalid clip id");
+        let sidecar = self.dir.join(format!("{id}.json"));
+        let mut videos = Vec::new();
+        match fs::symlink_metadata(&sidecar) {
+            Ok(meta) if meta.is_file() => videos.push(self.checked_video_path(&self.get(id)?)?),
+            Ok(meta) if meta.file_type().is_symlink() => (),
+            Ok(_) => bail!("sidecar is not a regular file"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
             Err(e) => return Err(e.into()),
         }
-        Ok(())
+        // Without a readable sidecar, only the conventional clip filenames are known.
+        if videos.is_empty() {
+            for extension in ["mp4", "mkv"] {
+                videos.push(self.checked_video_filename(&format!("{id}.{extension}"))?);
+            }
+        }
+        let mut paths: Vec<_> = videos.iter().map(PathBuf::as_path).collect();
+        paths.push(&sidecar);
+        let mut existing = Vec::new();
+        for path in paths {
+            match fs::symlink_metadata(path) {
+                Ok(_) => existing.push(path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        with_recovery_links(&existing, || {
+            for path in &existing {
+                remove_if_present(path)?;
+            }
+            Ok(())
+        })?;
+        remove_if_present(&crate::paths::thumbs_dir().join(format!("{id}.jpg")))
     }
 
     pub fn thumbnail(&self, clip: &ClipMeta) -> anyhow::Result<PathBuf> {
@@ -238,25 +295,152 @@ pub(crate) fn probe(path: &Path, id: &str) -> anyhow::Result<ClipMeta> {
     })
 }
 
-fn trash(path: &Path) -> anyhow::Result<()> {
-    let root = dirs::data_dir().context("no data directory")?.join("Trash");
+fn remove_if_present(path: &Path) -> anyhow::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn mount_top(path: &Path) -> anyhow::Result<PathBuf> {
+    mount_top_with(path, |p| Ok(fs::metadata(p)?.dev()))
+}
+
+fn mount_top_with(
+    path: &Path,
+    device: impl Fn(&Path) -> anyhow::Result<u64>,
+) -> anyhow::Result<PathBuf> {
+    let dev = device(path)?;
+    let mut top = path.parent().context("missing parent")?.to_path_buf();
+    while let Some(parent) = top.parent() {
+        if device(parent)? != dev {
+            break;
+        }
+        top = parent.to_path_buf();
+    }
+    Ok(top)
+}
+
+fn private_dir(path: &Path, uid: u32) -> anyhow::Result<()> {
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => (),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(e) => return Err(e.into()),
+    }
+    let meta = fs::symlink_metadata(path)?;
+    ensure!(
+        meta.is_dir() && meta.uid() == uid,
+        "unsafe trash directory {}",
+        path.display()
+    );
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn top_trashes(top: &Path, uid: u32) -> Vec<PathBuf> {
+    let shared = top.join(".Trash");
+    let mut roots = Vec::new();
+    if fs::symlink_metadata(&shared).is_ok_and(|m| m.is_dir() && m.mode() & 0o1000 != 0) {
+        roots.push(shared.join(uid.to_string()));
+    }
+    roots.push(top.join(format!(".Trash-{uid}")));
+    roots
+}
+
+fn trash_pair(video: &Path, sidecar: &Path) -> anyhow::Result<()> {
+    let video = fs::canonicalize(video)?;
+    let sidecar = fs::canonicalize(sidecar)?;
+    let uid = unsafe { libc::geteuid() };
+    let mut reasons = Vec::new();
+    let mut candidates = Vec::new();
+    if let Some(data) = dirs::data_dir() {
+        let root = data.join("Trash");
+        match fs::create_dir_all(&data) {
+            Ok(()) => candidates.push((root, None)),
+            Err(e) => reasons.push(format!("home trash: {e}")),
+        }
+    }
+    match mount_top(&video) {
+        Ok(top) => {
+            for root in top_trashes(&top, uid) {
+                candidates.push((root, Some(top.clone())));
+            }
+        }
+        Err(e) => reasons.push(format!("mount trash: {e:#}")),
+    }
+    try_trashes(&video, &sidecar, uid, candidates, reasons, gio_trash_pair)
+}
+
+fn try_trashes(
+    video: &Path,
+    sidecar: &Path,
+    uid: u32,
+    candidates: Vec<(PathBuf, Option<PathBuf>)>,
+    mut reasons: Vec<String>,
+    fallback: impl FnOnce(&Path, &Path) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    for (root, top) in candidates {
+        match trash_pair_in(video, sidecar, &root, top.as_deref(), uid) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // Never try another strategy after an unsuccessful rollback.
+                ensure!(
+                    video.try_exists()? && sidecar.try_exists()?,
+                    "trash rollback failed: {e:#}"
+                );
+                reasons.push(format!("{}: {e:#}", root.display()));
+            }
+        }
+    }
+    match fallback(video, sidecar) {
+        Ok(()) => return Ok(()),
+        Err(e) => reasons.push(format!("gio trash: {e:#}")),
+    }
+    Err(TrashUnavailable {
+        path: video.to_path_buf(),
+        reason: reasons.join("; "),
+    }
+    .into())
+}
+
+fn trash_pair_in(
+    video: &Path,
+    sidecar: &Path,
+    root: &Path,
+    top: Option<&Path>,
+    uid: u32,
+) -> anyhow::Result<()> {
+    private_dir(root, uid)?;
     let files = root.join("files");
     let info = root.join("info");
-    for dir in [&root, &files, &info] {
-        fs::create_dir_all(dir)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    private_dir(&files, uid)?;
+    private_dir(&info, uid)?;
+    let dev = fs::metadata(&files)?.dev();
+    ensure!(
+        fs::metadata(video)?.dev() == dev && fs::metadata(sidecar)?.dev() == dev,
+        "trash is on a different device"
+    );
+    let (dest, infopath) = trash_into(video, &files, &info, top)?;
+    if let Err(e) = trash_into(sidecar, &files, &info, top) {
+        fs::rename(&dest, video).context(format!("rollback failed after {e:#}"))?;
+        remove_if_present(&infopath)?;
+        return Err(e);
     }
-    if fs::metadata(path)?.dev() != fs::metadata(&files)?.dev() {
-        let status = Command::new("gio")
-            .arg("trash")
-            .arg("--")
-            .arg(path)
-            .status()?;
-        ensure!(status.success(), "gio trash failed for {}", path.display());
-        return Ok(());
-    }
-    let absolute = fs::canonicalize(path)?;
-    let encoded: String = absolute
+    Ok(())
+}
+
+fn trash_into(
+    path: &Path,
+    files: &Path,
+    info: &Path,
+    top: Option<&Path>,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let original = match top {
+        Some(top) => path.strip_prefix(top)?,
+        None => path,
+    };
+    let encoded: String = original
         .as_os_str()
         .as_bytes()
         .iter()
@@ -279,7 +463,7 @@ fn trash(path: &Path) -> anyhow::Result<()> {
             format!("{name}.{suffix}")
         };
         let dest = files.join(&name);
-        if dest.exists() {
+        if fs::symlink_metadata(&dest).is_ok() {
             continue;
         }
         let infopath = info.join(format!("{name}.trashinfo"));
@@ -299,13 +483,220 @@ fn trash(path: &Path) -> anyhow::Result<()> {
                 chrono::Local::now().format("%Y-%m-%dT%H:%M:%S")
             )?;
             record.sync_all()?;
-            fs::rename(path, dest)?;
+            fs::rename(path, &dest)?;
             Ok(())
         })();
-        if result.is_err() {
-            let _ = fs::remove_file(infopath);
+        if let Err(e) = result {
+            let _ = fs::remove_file(&infopath);
+            return Err(e);
         }
-        return result;
+        return Ok((dest, infopath));
     }
     bail!("cannot allocate trash name")
+}
+
+fn gio_trash_pair(video: &Path, sidecar: &Path) -> anyhow::Result<()> {
+    gio_trash_pair_with(video, sidecar, |paths| {
+        let output = Command::new("gio")
+            .arg("trash")
+            .arg("--")
+            .args(paths)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        Ok(())
+    })
+}
+
+fn gio_trash_pair_with(
+    video: &Path,
+    sidecar: &Path,
+    run: impl FnOnce(&[&Path]) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    with_recovery_links(&[video, sidecar], || run(&[video, sidecar]))
+}
+
+fn with_recovery_links(
+    paths: &[&Path],
+    run: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let Some(first) = paths.first() else {
+        return run();
+    };
+    // gio exposes no rollback destination and may move only one argument. Hard links
+    // also make permanent deletion recoverable without copying video data.
+    let backup = tempfile::Builder::new()
+        .prefix(".clippr-delete-")
+        .tempdir_in(first.parent().context("missing parent")?)?;
+    for (index, path) in paths.iter().enumerate() {
+        fs::hard_link(path, backup.path().join(index.to_string()))?;
+    }
+    if let Err(e) = run() {
+        for (index, path) in paths.iter().enumerate() {
+            if matches!(fs::symlink_metadata(path), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound)
+            {
+                if let Err(restore) = fs::rename(backup.path().join(index.to_string()), path) {
+                    let retained = backup.keep();
+                    bail!(
+                        "rollback failed after {e:#}: {restore}; recovery files retained in {}",
+                        retained.display()
+                    );
+                }
+            }
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn pair(dir: &Path) -> (PathBuf, PathBuf) {
+        let video = dir.join("clip #.mp4");
+        let sidecar = dir.join("clip #.json");
+        fs::write(&video, b"video").unwrap();
+        fs::write(&sidecar, b"sidecar").unwrap();
+        (video, sidecar)
+    }
+
+    #[test]
+    fn injected_mount_boundary_and_topdir_selection() -> anyhow::Result<()> {
+        let top = mount_top_with(Path::new("/mount/clips/video.mp4"), |path| {
+            Ok(if path == Path::new("/") { 1 } else { 2 })
+        })?;
+        assert_eq!(top, Path::new("/mount"));
+        let tmp = tempfile::tempdir()?;
+        let uid = unsafe { libc::geteuid() };
+        let private = tmp.path().join(format!(".Trash-{uid}"));
+        assert_eq!(top_trashes(tmp.path(), uid), vec![private.clone()]);
+        let shared = tmp.path().join(".Trash");
+        fs::create_dir(&shared)?;
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777))?;
+        assert_eq!(top_trashes(tmp.path(), uid), vec![private.clone()]);
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777))?;
+        assert_eq!(
+            top_trashes(tmp.path(), uid),
+            vec![shared.join(uid.to_string()), private.clone()]
+        );
+        fs::remove_dir(&shared)?;
+        let target = tmp.path().join("target");
+        fs::create_dir(&target)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o1777))?;
+        symlink(target, &shared)?;
+        assert_eq!(top_trashes(tmp.path(), uid), vec![private.clone()]);
+        symlink(&shared, &private)?;
+        assert!(private_dir(&private, uid).is_err());
+        assert!(private_dir(&tmp.path().join("wrong-owner"), uid.wrapping_add(1)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn topdir_paths_are_relative_and_collisions_preserve_entries() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (video, sidecar) = pair(tmp.path());
+        let uid = unsafe { libc::geteuid() };
+        let root = tmp.path().join(format!(".Trash-{uid}"));
+        trash_pair_in(&video, &sidecar, &root, Some(tmp.path()), uid)?;
+        let info = fs::read_to_string(root.join("info/clip #.mp4.trashinfo"))?;
+        assert!(info.contains("\nPath=clip%20%23.mp4\n"));
+        pair(tmp.path());
+        trash_pair_in(&video, &sidecar, &root, Some(tmp.path()), uid)?;
+        assert_eq!(fs::read(root.join("files/clip #.mp4"))?, b"video");
+        assert_eq!(fs::read(root.join("files/clip #.mp4.1"))?, b"video");
+        assert_eq!(fs::metadata(root)?.mode() & 0o777, 0o700);
+        Ok(())
+    }
+
+    #[test]
+    fn sidecar_info_failure_rolls_video_back() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (video, old_sidecar) = pair(tmp.path());
+        // The source fits NAME_MAX, but adding .trashinfo does not.
+        let sidecar = tmp.path().join("s".repeat(250));
+        fs::rename(old_sidecar, &sidecar)?;
+        let root = tmp.path().join("Trash");
+        let err = trash_pair_in(&video, &sidecar, &root, None, unsafe { libc::geteuid() });
+        assert!(err.is_err());
+        assert_eq!(fs::read(&video)?, b"video");
+        assert_eq!(fs::read(&sidecar)?, b"sidecar");
+        assert_eq!(fs::read_dir(root.join("files"))?.count(), 0);
+        assert_eq!(fs::read_dir(root.join("info"))?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_downcasts_and_keeps_fallback_diagnostics() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (video, sidecar) = pair(tmp.path());
+        let unsafe_root = tmp.path().join("unsafe");
+        symlink(tmp.path(), &unsafe_root)?;
+        let err = try_trashes(
+            &video,
+            &sidecar,
+            unsafe { libc::geteuid() },
+            vec![(unsafe_root, None)],
+            vec![],
+            |_, _| bail!("exit status: 1: simulated gio stderr"),
+        )
+        .unwrap_err();
+        let typed = err.downcast_ref::<TrashUnavailable>().unwrap();
+        assert_eq!(typed.path, video);
+        assert!(typed.reason.contains("simulated gio stderr"));
+        assert!(err.to_string().contains("can't move"));
+        assert!(sidecar.exists());
+        assert!(video.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn gio_partial_failure_and_permanent_failure_restore_both_files() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (video, sidecar) = pair(tmp.path());
+        let err = gio_trash_pair_with(&video, &sidecar, |paths| {
+            fs::remove_file(paths[0])?;
+            bail!("sidecar failed")
+        });
+        assert!(err.is_err());
+        assert_eq!(fs::read(&video)?, b"video");
+        assert_eq!(fs::read(&sidecar)?, b"sidecar");
+        let err = with_recovery_links(&[&video, &sidecar], || {
+            fs::remove_file(&video)?;
+            bail!("sidecar remove failed")
+        });
+        assert!(err.is_err());
+        assert_eq!(fs::read(&video)?, b"video");
+        assert_eq!(fs::read(&sidecar)?, b"sidecar");
+        assert_eq!(fs::read_dir(tmp.path())?.count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_trash_files_on_another_device() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (video, sidecar) = pair(tmp.path());
+        // Only create inside an owned temporary directory on the other device.
+        if let Ok(other) = tempfile::tempdir_in("/dev/shm") {
+            if fs::metadata(other.path())?.dev() != fs::metadata(tmp.path())?.dev() {
+                let err = trash_pair_in(
+                    &video,
+                    &sidecar,
+                    &other.path().join("Trash"),
+                    None,
+                    unsafe { libc::geteuid() },
+                )
+                .unwrap_err();
+                assert!(err.to_string().contains("different device"));
+                assert!(video.exists());
+                assert!(sidecar.exists());
+            }
+        }
+        Ok(())
+    }
 }

@@ -12,3 +12,4 @@ toml.workspace = true
 dirs.workspace = true
 chrono.workspace = true
 tempfile = "3"
+libc = "0.2"

@@ -243,19 +243,34 @@ fn media_library_and_exports() -> anyhow::Result<()> {
     assert!(trash.join("files/source.mp4.1").exists());
     let info = std::fs::read_to_string(trash.join("info/source.mp4.1.trashinfo"))?;
     assert!(info.contains("space%20%23%20dir"));
-    // Exercise the cross-filesystem failure path without invoking the user's trash service.
-    if let Ok(other_fs) = tempfile::tempdir_in("/dev/shm") {
-        use std::os::unix::fs::MetadataExt;
-        if std::fs::metadata(other_fs.path())?.dev() != std::fs::metadata(&clips)?.dev() {
-            let bin = tmp.path().join("bin");
-            std::fs::create_dir(&bin)?;
-            std::fs::copy("/usr/bin/false", bin.join("gio"))?;
-            std::env::set_var("PATH", &bin);
-            std::env::set_var("XDG_DATA_HOME", other_fs.path());
-            assert!(lib.delete("corrupt").is_err());
-            assert!(clips.join("corrupt.mkv").exists());
-            assert!(clips.join("corrupt.json").exists());
-        }
-    }
+    // Permanent deletion also cleans up orphaned metadata and cached thumbnails.
+    let outside = tmp.path().join("outside.json");
+    std::fs::write(&outside, "do not follow")?;
+    std::os::unix::fs::symlink(&outside, spaced.dir().join("linked.json"))?;
+    std::fs::write(spaced.dir().join("linked.mp4"), "video")?;
+    spaced.delete_permanently("linked")?;
+    assert_eq!(std::fs::read_to_string(&outside)?, "do not follow");
+    assert!(!spaced.dir().join("linked.mp4").exists());
+    assert!(std::fs::symlink_metadata(spaced.dir().join("linked.json")).is_err());
+    spaced.delete_permanently("linked")?;
+    assert!(spaced.delete_permanently("../outside").is_err());
+    let mut orphan_meta = lib.get("corrupt")?;
+    orphan_meta.id = "orphan-sidecar".into();
+    orphan_meta.file = "orphan-sidecar.mp4".into();
+    lib.update(&orphan_meta)?;
+    lib.delete_permanently("orphan-sidecar")?;
+    assert!(!clips.join("orphan-sidecar.json").exists());
+    let corrupt_thumb = clippr_core::paths::thumbs_dir().join("corrupt.jpg");
+    std::fs::write(&corrupt_thumb, "thumbnail")?;
+    lib.delete_permanently("corrupt")?;
+    assert!(!corrupt_thumb.exists());
+    assert!(!clips.join("corrupt.mkv").exists());
+    assert!(!clips.join("corrupt.json").exists());
+    std::fs::write(spaced.dir().join("orphan.mkv"), "video")?;
+    spaced.delete_permanently("orphan")?;
+    assert!(!spaced.dir().join("orphan.mkv").exists());
+    std::os::unix::fs::symlink(&outside, spaced.dir().join("unsafe.mp4"))?;
+    assert!(spaced.delete_permanently("unsafe").is_err());
+    assert_eq!(std::fs::read_to_string(&outside)?, "do not follow");
     Ok(())
 }

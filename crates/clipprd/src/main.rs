@@ -4,6 +4,7 @@ mod ipc;
 mod portal;
 mod ring;
 mod save;
+mod tray;
 
 use std::{
     sync::{Arc, Mutex},
@@ -402,6 +403,7 @@ impl Daemon {
 async fn main() -> Result<()> {
     let mut verbose = false;
     let mut test = false;
+    let mut show_tray = true;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--version" | "-V" => {
@@ -410,9 +412,10 @@ async fn main() -> Result<()> {
             }
             "--verbose" | "-v" => verbose = true,
             "--test-source" => test = true,
+            "--no-tray" => show_tray = false,
             "--help" | "-h" => {
                 println!(
-                    "clipprd [--version] [--verbose] [--test-source]\n--test-source uses synthetic video/audio; never opens the capture picker or binds hotkeys."
+                    "clipprd [--version] [--verbose] [--test-source] [--no-tray]\n--test-source uses synthetic video/audio; never opens the capture picker or binds hotkeys.\n--no-tray skips the system tray icon."
                 );
                 return Ok(());
             }
@@ -502,6 +505,9 @@ async fn main() -> Result<()> {
         if let Err(error) = portal::prepare_identity() {
             warn!(%error, "portal desktop identity unavailable");
         }
+    }
+    if show_tray {
+        tray::spawn(daemon.tx.clone(), daemon.events.clone());
     }
     daemon.bind_hotkeys();
     daemon.start_capture();

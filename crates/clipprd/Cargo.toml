@@ -20,6 +20,7 @@ ashpd = { version = "0.13", default-features = false, features = ["tokio", "scre
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "net", "io-util", "signal", "sync", "time", "process", "macros"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+ksni = { version = "0.3", default-features = false, features = ["tokio"] }
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

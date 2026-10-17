@@ -154,6 +154,13 @@ fn media_library_and_exports() -> anyhow::Result<()> {
     let precise = export(&lib, &req, &mut |_| (), &cancel)?;
     assert_eq!(precise.id, "source_edit-2");
     assert!((duration(&lib.video_path(&precise)) - 3.0).abs() < 0.15);
+    assert_eq!((precise.width, precise.height, precise.fps), (640, 360, 30));
+    assert!(Command::new("ffmpeg")
+        .args(["-v", "error", "-xerror", "-i"])
+        .arg(lib.video_path(&precise))
+        .args(["-f", "null", "-"])
+        .status()?
+        .success());
     // Preserve the requested ordering and clamp out-of-range segments.
     req.keep = vec![
         Segment {

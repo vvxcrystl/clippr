@@ -1,5 +1,6 @@
 //! Clip trimming and cutting with cancellable ffmpeg exports.
 use crate::clip::ClipMeta;
+use crate::config::{Codec, Config, KEYFRAME_INTERVAL_SECS};
 use crate::library::{probe, Library};
 use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
@@ -88,6 +89,15 @@ pub fn export(
             .as_array()
             .context("invalid audio probe")?
             .is_empty();
+        // Preserve the source codec on hardware rather than expanding HEVC/AV1
+        // into H.264. Exports use the same Medium budget/quality rules as capture.
+        let mut encoding = Config::default();
+        encoding.video.codec = match source.codec.as_str() {
+            "hevc" => Codec::Hevc,
+            "av1" => Codec::Av1,
+            _ => Codec::H264,
+        };
+        encoding.video.fps = source.fps.clamp(1, 240);
         for hardware in [true, false] {
             let mut filter = String::new();
             let mut labels = String::new();
@@ -127,11 +137,28 @@ pub fn export(
                 cmd.args(["-map", "[a]", "-c:a", "aac", "-b:a", "160k"]);
             }
             if hardware {
-                cmd.args(["-c:v", "h264_vaapi"]);
+                let codec = match encoding.video.codec {
+                    Codec::H264 => "h264_vaapi",
+                    Codec::Hevc => "hevc_vaapi",
+                    Codec::Av1 => "av1_vaapi",
+                };
+                cmd.args(["-c:v", codec, "-rc_mode", "VBR", "-quality", "1", "-qmin"])
+                    .arg(encoding.video.quality_quantizer().unwrap_or(20).to_string());
             } else {
+                encoding.video.codec = Codec::H264;
                 cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]);
             }
-            cmd.args(["-movflags", "+faststart"]).arg(&output);
+            let bitrate = encoding.video_bitrate_kbps(source.height);
+            cmd.args([
+                "-b:v",
+                &format!("{bitrate}k"),
+                "-maxrate",
+                &format!("{bitrate}k"),
+            ])
+            .args(["-bufsize", &format!("{}k", bitrate * 2), "-bf", "0", "-g"])
+            .arg((encoding.video.fps * KEYFRAME_INTERVAL_SECS).to_string())
+            .args(["-fps_mode", "passthrough", "-movflags", "+faststart"])
+            .arg(&output);
             match run(cmd, total, progress, cancel) {
                 Ok(()) => break,
                 Err(e) if hardware && !cancel.load(Ordering::Relaxed) => {

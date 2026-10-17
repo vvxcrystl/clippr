@@ -6,6 +6,9 @@ use std::{io::Write, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum GOP duration, also enforced by timestamps for variable-rate capture.
+pub const KEYFRAME_INTERVAL_SECS: u32 = 2;
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -31,10 +34,11 @@ pub struct General {
 }
 
 impl General {
-    /// Seconds of history the replay buffer must hold: the longest clip length, plus 2s
-    /// of slack so a clip can start on a keyframe.
+    /// Keep a whole GOP before the requested start, plus one second for stream skew.
     pub fn buffer_secs(&self) -> u32 {
-        self.clip_short_secs.max(self.clip_long_secs) + 2
+        self.clip_short_secs
+            .max(self.clip_long_secs)
+            .saturating_add(KEYFRAME_INTERVAL_SECS + 1)
     }
 }
 
@@ -97,6 +101,24 @@ pub struct Video {
     pub resolution: Resolution,
     pub encoder: EncoderPref,
     pub capture_cursor: bool,
+}
+
+impl Video {
+    /// Quality ceiling for preset VA encodes: stop spending bits once this QP is
+    /// reached, while VBR can raise it on difficult content to target the budget.
+    /// AV1 uses a 0..255 quantizer index rather than H.264/HEVC's 0..51 QP.
+    /// Custom keeps the user's bitrate without a preset quality ceiling.
+    pub fn quality_quantizer(&self) -> Option<u32> {
+        match (self.codec, self.quality) {
+            (_, Quality::Custom) => None,
+            (Codec::Av1, Quality::Low) => Some(100),
+            (Codec::Av1, Quality::Medium) => Some(60),
+            (Codec::Av1, Quality::High) => Some(40),
+            (_, Quality::Low) => Some(26),
+            (_, Quality::Medium) => Some(20),
+            (_, Quality::High) => Some(16),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -196,11 +218,14 @@ impl Config {
         Ok(())
     }
 
-    /// Bitrate the encoder should target for an output of `height` pixels.
+    /// Preset VBR budget (kbps) for `height` at the configured maximum frame rate.
+    /// Flat content uses less; this remains the Settings buffer-memory estimate's
+    /// input. Custom is the user's unscaled bitrate, independent of codec and fps.
+    /// VA drivers can overshoot this nominal budget; it is not a memory limit.
     pub fn video_bitrate_kbps(&self, height: u32) -> u32 {
-        // Medium is tuned to look clean at 60fps in fast games without bloating the buffer.
+        // The table is a 60fps budget; preserve bits/frame at other capture rates.
         let base = match height {
-            0..=720 => 6_000,
+            0..=720 => 6_000u32,
             721..=1080 => 10_000,
             1081..=1440 => 16_000,
             _ => 28_000,
@@ -211,17 +236,49 @@ impl Config {
             Quality::High => base * 16 / 10,
             Quality::Custom => return self.video.bitrate_kbps.max(500),
         };
-        // HEVC and AV1 reach the same quality with fewer bits.
-        match self.video.codec {
+        let scaled = match self.video.codec {
             crate::config::Codec::H264 => scaled,
             _ => scaled * 7 / 10,
-        }
+        };
+        (u64::from(scaled) * u64::from(self.video.fps.clamp(1, 240)) / 60).clamp(500, 200_000)
+            as u32
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preset_budgets_scale_with_fps_but_custom_does_not() {
+        let mut config = Config::default();
+        for (fps, budget) in [(30, 5_000), (60, 10_000), (120, 20_000), (144, 24_000)] {
+            config.video.fps = fps;
+            assert_eq!(config.video_bitrate_kbps(1080), budget);
+        }
+        config.video.codec = Codec::Av1;
+        assert_eq!(config.video_bitrate_kbps(1080), 16_800);
+        config.video.quality = Quality::Custom;
+        config.video.bitrate_kbps = 12_345;
+        assert_eq!(config.video_bitrate_kbps(1080), 12_345);
+        assert_eq!(config.video.quality_quantizer(), None);
+    }
+
+    #[test]
+    fn old_partial_configs_keep_defaults_and_quality_order() -> anyhow::Result<()> {
+        let mut config: Config = toml::from_str("[video]\nfps = 120\n")?;
+        assert_eq!(config.video.codec, Codec::H264);
+        assert_eq!(config.general.buffer_secs(), 63);
+        let mut previous = (u32::MAX, 0);
+        for quality in [Quality::Low, Quality::Medium, Quality::High] {
+            config.video.quality = quality;
+            let qp = config.video.quality_quantizer().unwrap();
+            let budget = config.video_bitrate_kbps(1080);
+            assert!(qp < previous.0 && budget > previous.1);
+            previous = (qp, budget);
+        }
+        Ok(())
+    }
 
     #[test]
     fn concurrent_saves_use_independent_temp_files() -> anyhow::Result<()> {

@@ -1,0 +1,17 @@
+[Unit]
+Description=clippr replay buffer capture daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/clipprd
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=130
+Nice=10
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=clippr
+Comment=Replay buffer clipper
+Exec=clipprd
+Icon=video-x-generic
+Categories=AudioVideo;Video;
+NoDisplay=true

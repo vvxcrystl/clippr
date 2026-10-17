@@ -367,6 +367,42 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay) -> gtk::Widget {
         let r = abitrate.clone();
         move |c| r.set_value(c.audio.bitrate_kbps as f64)
     }));
+
+    let separate = adw::SwitchRow::builder()
+        .title("Separate audio tracks")
+        .subtitle("Game, microphone and voice chat each get a track. The first track is always the full mix, so clips still play everywhere")
+        .build();
+    audio.add(&separate);
+    let voice_apps = adw::EntryRow::builder()
+        .title("Voice chat apps, comma separated")
+        .show_apply_button(true)
+        .build();
+    audio.add(&voice_apps);
+    {
+        let ed = ed.clone();
+        separate.connect_active_notify(move |r| ed.edit(|c| c.audio.separate_tracks = r.is_active()));
+    }
+    {
+        let ed = ed.clone();
+        voice_apps.connect_apply(move |r| {
+            let mut apps: Vec<String> = r
+                .text()
+                .split(',')
+                .map(|a| a.trim().to_lowercase())
+                .filter(|a| !a.is_empty())
+                .collect();
+            apps.dedup();
+            ed.edit(|c| c.audio.voice_apps = apps);
+        });
+    }
+    load(Box::new({
+        let (s, v) = (separate.clone(), voice_apps.clone());
+        move |c| {
+            s.set_active(c.audio.separate_tracks);
+            v.set_text(&c.audio.voice_apps.join(", "));
+            v.set_sensitive(c.audio.separate_tracks);
+        }
+    }));
     page.add(&audio);
 
     // --- Hotkeys -------------------------------------------------------------------------

@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use adw::prelude::*;
-use clippr_core::clip::ClipMeta;
-use clippr_core::edit::{self, ExportRequest};
+use clippr_core::clip::{AudioTrackKind, ClipMeta};
+use clippr_core::edit::{self, ExportRequest, TrackGain};
 use gtk::{gdk, gio, glib};
 
 use crate::state::State;
@@ -136,6 +136,25 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
     export_group.add(&kept_row);
     export_group.add(&precise_row);
 
+    // Per-source levels for the exported mix. Only clips recorded with separate tracks have
+    // sources to balance; the playback preview always plays the recorded mix.
+    let track_controls: Rc<Vec<TrackControl>> = Rc::new(
+        clip.borrow()
+            .audio_tracks
+            .iter()
+            .filter(|t| t.kind != AudioTrackKind::Mix)
+            .map(|t| TrackControl::new(t.kind, &t.label))
+            .collect(),
+    );
+    let audio_group = adw::PreferencesGroup::builder()
+        .title("Audio tracks")
+        .description("Sets each source's volume in the exported mix. The separate tracks are kept as recorded.")
+        .visible(!track_controls.is_empty())
+        .build();
+    for control in track_controls.iter() {
+        audio_group.add(&control.row);
+    }
+
     let save_new = gtk::Button::with_label("Save as new clip");
     save_new.add_css_class("suggested-action");
     save_new.add_css_class("pill");
@@ -165,6 +184,7 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
         .build();
     sidebar_box.append(&details);
     sidebar_box.append(&export_group);
+    sidebar_box.append(&audio_group);
     sidebar_box.append(&export_buttons);
     sidebar_box.append(&info);
     let sidebar = gtk::ScrolledWindow::builder()
@@ -232,6 +252,7 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
         let (kept_row, undo, reset, delete_part, replace) =
             (kept_row.clone(), undo.clone(), reset.clone(), delete_part.clone(), replace.clone());
         let save_new = save_new.clone();
+        let track_controls = track_controls.clone();
         Rc::new(move || {
             let parts = timeline.parts().len();
             kept_row.set_subtitle(&format!(
@@ -241,7 +262,7 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
                 parts,
                 if parts == 1 { "" } else { "s" },
             ));
-            let untouched = timeline.is_untouched();
+            let untouched = timeline.is_untouched() && !gains_changed(&track_controls);
             undo.set_sensitive(timeline.can_undo());
             reset.set_sensitive(!untouched);
             delete_part.set_sensitive(parts > 1);
@@ -253,6 +274,10 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
     {
         let refresh_tools = refresh_tools.clone();
         timeline.connect_changed(move || refresh_tools());
+    }
+    for control in track_controls.iter() {
+        let refresh_tools = refresh_tools.clone();
+        control.connect_changed(move || refresh_tools());
     }
     {
         let media = media.clone();
@@ -547,6 +572,7 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
     let cancel_flag: Rc<RefCell<Option<Arc<AtomicBool>>>> = Rc::default();
     let exporting = Rc::new(Cell::new(false));
     for (button, replace_source) in [(save_new.clone(), false), (replace.clone(), true)] {
+        let track_controls = track_controls.clone();
         let state = state.clone();
         let toasts = toasts.clone();
         let timeline = timeline.clone();
@@ -570,6 +596,7 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
                 title: if replace_source { src.title.clone() } else { format!("{} (edit)", src.title) },
                 precise: precise_row.is_active(),
                 replace_source,
+                track_gains: gains(&track_controls),
             };
             let run = {
                 let state = state.clone();
@@ -712,6 +739,68 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
     page
 }
 
+/// Volume slider and mute button for one source track's share of the exported mix.
+struct TrackControl {
+    kind: AudioTrackKind,
+    row: adw::ActionRow,
+    scale: gtk::Scale,
+    mute: gtk::ToggleButton,
+}
+
+impl TrackControl {
+    fn new(kind: AudioTrackKind, label: &str) -> Self {
+        let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 150.0, 5.0);
+        scale.set_value(100.0);
+        scale.set_width_request(130);
+        scale.set_valign(gtk::Align::Center);
+        scale.add_mark(100.0, gtk::PositionType::Bottom, None);
+        scale.set_draw_value(true);
+        scale.set_value_pos(gtk::PositionType::Left);
+        scale.set_format_value_func(|_, v| format!("{v:.0}%"));
+        let mute = gtk::ToggleButton::builder()
+            .icon_name("audio-volume-high-symbolic")
+            .tooltip_text("Mute in the mix")
+            .valign(gtk::Align::Center)
+            .build();
+        mute.add_css_class("flat");
+        {
+            let scale = scale.clone();
+            mute.connect_toggled(move |b| {
+                let muted = b.is_active();
+                b.set_icon_name(if muted { "audio-volume-muted-symbolic" } else { "audio-volume-high-symbolic" });
+                scale.set_sensitive(!muted);
+            });
+        }
+        let row = adw::ActionRow::builder().title(label).title_lines(1).build();
+        row.add_suffix(&scale);
+        row.add_suffix(&mute);
+        Self { kind, row, scale, mute }
+    }
+
+    /// Linear gain for the mix: 0 when muted, otherwise the slider as a fraction.
+    fn gain(&self) -> f32 {
+        if self.mute.is_active() {
+            0.0
+        } else {
+            (self.scale.value() / 100.0) as f32
+        }
+    }
+
+    fn connect_changed(&self, f: impl Fn() + Clone + 'static) {
+        let g = f.clone();
+        self.scale.connect_value_changed(move |_| g());
+        self.mute.connect_toggled(move |_| f());
+    }
+}
+
+fn gains(controls: &[TrackControl]) -> Vec<TrackGain> {
+    controls.iter().map(|c| TrackGain { kind: c.kind, gain: c.gain() }).collect()
+}
+
+fn gains_changed(controls: &[TrackControl]) -> bool {
+    controls.iter().any(|c| (c.gain() - 1.0).abs() > 0.001)
+}
+
 fn pop(page: &adw::NavigationPage) {
     if let Some(nav) = page.ancestor(adw::NavigationView::static_type()).and_downcast::<adw::NavigationView>() {
         nav.pop();
@@ -747,6 +836,10 @@ fn fill_info(group: &adw::PreferencesGroup, clip: &ClipMeta) {
     rows.push(("Length", util::duration_precise(clip.duration_secs)));
     rows.push(("Video", format!("{}×{}, {} fps, {}", clip.width, clip.height, clip.fps, util::codec_name(&clip.codec))));
     rows.push(("Size", util::size(clip.size_bytes)));
+    if clip.audio_tracks.len() > 1 {
+        let labels: Vec<&str> = clip.audio_tracks.iter().map(|t| t.label.as_str()).collect();
+        rows.push(("Audio", labels.join(", ")));
+    }
     if let Some(src) = &clip.edited_from {
         rows.push(("Cut from", src.clone()));
     }

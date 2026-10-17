@@ -1,4 +1,5 @@
 use clippr_core::{
+    clip::AudioTrackKind,
     edit::{export, ExportRequest, Segment},
     library::Library,
 };
@@ -521,5 +522,26 @@ fn multitrack_exports_preserve_sources_and_rebuild_only_mix() -> anyhow::Result<
     assert!(tone_amplitude(&decoded_audio(&lib.video_path(&muted), 0), 440.0) < 0.0001);
     req.track_gains[0].gain = f32::NAN;
     assert!(export(&lib, &req, &mut |_| (), &cancel).is_err());
+    Ok(())
+}
+
+#[test]
+fn probing_reads_ffmpeg_mp4_track_names() -> anyhow::Result<()> {
+    // ffmpeg's MP4 muxer stores per-track titles as the `name` tag, not `title`.
+    let dir = tempfile::tempdir()?;
+    let status = Command::new("ffmpeg")
+        .args(["-v", "error", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=10"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440", "-f", "lavfi", "-i", "sine=frequency=550"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=660", "-t", "1"])
+        .args(["-map", "0:v", "-map", "1:a", "-map", "2:a", "-map", "3:a"])
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+        .args(["-metadata:s:a:0", "title=Mix", "-metadata:s:a:1", "title=Game"])
+        .args(["-metadata:s:a:2", "title=Voice chat"])
+        .arg(dir.path().join("named.mp4"))
+        .status()?;
+    assert!(status.success());
+    let clips = Library::open(dir.path()).list()?;
+    let kinds: Vec<_> = clips[0].audio_tracks.iter().map(|t| t.kind).collect();
+    assert_eq!(kinds, [AudioTrackKind::Mix, AudioTrackKind::Desktop, AudioTrackKind::Voice]);
     Ok(())
 }

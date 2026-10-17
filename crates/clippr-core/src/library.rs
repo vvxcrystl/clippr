@@ -300,10 +300,12 @@ pub(crate) fn probe(path: &Path, id: &str) -> anyhow::Result<ClipMeta> {
             .enumerate()
             .map(|(index, stream)| {
                 use crate::clip::{AudioTrack, AudioTrackKind};
-                let label = stream["tags"]["title"]
-                    .as_str()
-                    .or_else(|| stream["tags"]["handler_name"].as_str())
-                    .filter(|s| !s.is_empty() && *s != "SoundHandler");
+                // ffmpeg's MP4 muxer stores a track title as `name`; other muxers use
+                // `title` or the handler name. "SoundHandler" is the generic default.
+                let label = ["title", "name", "handler_name"]
+                    .iter()
+                    .filter_map(|key| stream["tags"][*key].as_str())
+                    .find(|s| !s.is_empty() && *s != "SoundHandler");
                 let kind = label
                     .and_then(AudioTrackKind::from_label)
                     .unwrap_or(AudioTrackKind::Mix);

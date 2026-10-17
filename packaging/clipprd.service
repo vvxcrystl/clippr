@@ -5,6 +5,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
+NoNewPrivileges=yes
 ExecStart=%h/.local/bin/clipprd
 Restart=on-failure
 RestartSec=5

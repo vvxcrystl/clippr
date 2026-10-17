@@ -1,0 +1,55 @@
+//! Clip metadata. Each `<id>.mp4` in the clips dir has a `<id>.json` sidecar holding a
+//! [`ClipMeta`]. The sidecar is the source of truth for titles, tags and app info.
+
+use chrono::{DateTime, Local};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClipMeta {
+    /// File stem shared by the video and its sidecar, e.g. `2026-10-16_22-41-07_cs2`.
+    /// Only `[A-Za-z0-9._-]` characters; never contains a path separator.
+    pub id: String,
+    /// User-facing title. Defaults to `"<app name> <local time>"`.
+    pub title: String,
+    /// Video file name inside the clips dir, e.g. `<id>.mp4`.
+    pub file: String,
+    pub created_at: DateTime<Local>,
+    pub duration_secs: f64,
+    /// Focused window when the clip was saved, if the compositor exposes it.
+    #[serde(default)]
+    pub app: Option<AppInfo>,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    /// `"h264"`, `"hevc"` or `"av1"`.
+    pub codec: String,
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub favorite: bool,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Id of the clip this one was cut from.
+    #[serde(default)]
+    pub edited_from: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppInfo {
+    /// Human-readable name, e.g. `"Counter-Strike 2"`.
+    pub name: String,
+    /// Wayland app_id or X11 WM_CLASS, e.g. `"steam_app_730"`.
+    #[serde(default)]
+    pub class: Option<String>,
+    #[serde(default)]
+    pub window_title: Option<String>,
+    #[serde(default)]
+    pub pid: Option<u32>,
+}
+
+/// Returns true if `id` is safe to join onto the clips dir.
+pub fn is_valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 200
+        && !id.starts_with('.')
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}

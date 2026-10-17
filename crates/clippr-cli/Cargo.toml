@@ -1,0 +1,13 @@
+[package]
+name = "clippr-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "clippr"
+path = "src/main.rs"
+
+[dependencies]
+clippr-core.workspace = true
+anyhow.workspace = true

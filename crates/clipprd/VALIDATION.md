@@ -4,6 +4,107 @@ Machine: KDE Plasma 6 Wayland, AMD RX 9060 XT, Mesa radeonsi VAAPI,
 GStreamer 1.28.8, Rust 1.97. All Cargo commands used
 `CARGO_TARGET_DIR=target/daemon`.
 
+## Follow-up validation
+
+- Saving now chooses the last keyframe at or before the requested start, or the
+  oldest available keyframe when history is shorter. A new unit test covers a
+  cutoff between keyframes, an exact boundary, and a request longer than history.
+  The architecture and daemon README describe the corrected rule.
+- A live 1080p60 VA H.264/AAC save for 10 seconds on the final build contained
+  **10.283333 seconds** of video (617 frames), starting at zero on a keyframe;
+  audio started at 0.0185 seconds. Full ffmpeg decode passed, and adjacent
+  keyframes were no more than 1.1 seconds apart. Before saving, the full ring
+  contained 40,173,161 bytes over 31.65 seconds.
+- `cargo test --workspace`: passed (seven daemon unit tests, shared-core unit
+  and media/export tests). `cargo clippy -p clipprd --no-deps -- -D warnings`:
+  passed with no warnings. No GUI or core code changed.
+- The release smoke test passed for VA H.264, HEVC, AV1 and software H.264,
+  checking **video stream duration >= requested duration**. Observed durations
+  were 5.066667, 2.033333, 2.733333 and 2.066667 seconds respectively for
+  requests of 5, 2, 2 and 2 seconds. Decode, audio, keyframes, sidecars,
+  thumbnails, IPC and lifecycle checks also passed.
+- Shortcut options now forward their nonempty string `activation_token` to the
+  overlay's `XDG_ACTIVATION_TOKEN`. A unit test checks the explicit token versus
+  no token; the smoke test starts the daemon with stale activation/startup
+  credentials and asserts the IPC-launched overlay inherits neither. All daemon
+  child-command sites discard inherited `XDG_ACTIVATION_TOKEN` and
+  `DESKTOP_STARTUP_ID`. Physical shortcut activation and resulting GTK focus
+  remain unverified.
+- The packaged library launcher and the daemon use the same portal identity,
+  `dev.clippr.Clippr`; the standalone hidden fallback derives from that packaged
+  template. Both desktop entries (packaged and generated fallback) passed
+  `desktop-file-validate`. `bash -n` passed for install/uninstall. The unit passed
+  `systemd-analyze --user verify` with its executable replaced by the built binary.
+  Install/uninstall were not run, and the live installation was not changed.
+  In particular, KDE shortcut display-name/icon integration after installation
+  remains unverified: the real portal cannot see a desktop entry created only
+  in the isolated daemon's `XDG_DATA_HOME`, so it rejected shortcut registration
+  during these runs.
+
+### Follow-up CPU investigation
+
+All capture runs used isolated config/state/cache/runtime/data directories, the
+real PipeWire runtime for audio, 1920x1080 at 60 fps, VA H.264 at 10 Mbps, and
+desktop stereo FDK AAC at 160 kbps. DMA-BUF source and VA-memory encoder-input
+negotiation were checked again. The production encoded callbacks already keep
+`gst::Buffer` references; they do not copy packet payloads. Trimming checks queue
+fronts, and there is no per-frame logging or focus polling to remove.
+
+The baseline was measured over 45.001 seconds using `/proc/PID/task/TID/schedstat`
+CPU-runtime deltas (nanosecond resolution). This includes kernel time and reports
+percentages of one core. The actor and all other listed worker threads were idle.
+
+- `screen:src`: **0.994%**, 363.95 context switches/s.
+- `desktop:src`: **0.496%**, 97.95 context switches/s.
+- Mesa `clipprd:cs0`: **0.272%**, 124.60 context switches/s.
+- Two `pipewire-main-l` loops: **0.043% + 0.040%**.
+- Daemon actor and remaining workers: **0.000%**.
+- Total: **1.845%**.
+
+A temporary build increased video keepalive from 16 to 100 ms and requested
+`node.latency=2048/48000` for audio sources. The installed PipeWire 1.6.9 source
+has no `latency-time` or `buffer-time` properties. `pw-dump` confirmed the audio
+latency preference reached the stream; it did not change the shared graph's
+observed roughly 47 audio wakeups/s. The portal continued supplying 60 fps, as
+confirmed by the saved video's packet count, even with the slower keepalive.
+Over 45.001 seconds this build used **1.761%**: video **0.934%**, audio **0.496%**,
+Mesa submission **0.252%**, PipeWire loops **0.041% + 0.038%**, actor **0.000%**.
+The small difference does not establish a repeatable improvement. Both tuning
+changes were removed; the media path and configured capture fidelity are retained.
+
+The final build, with both experiments removed, measured **1.819%** over
+45.001 seconds (process-wide tick counter: **1.844%**):
+
+- `screen:src`: **0.994%**, 365.21 context switches/s.
+- `desktop:src`: **0.491%**, 102.18 context switches/s.
+- Mesa `clipprd:cs0`: **0.251%**, 121.80 context switches/s.
+- Two `pipewire-main-l` loops: **0.042% + 0.040%**.
+- Daemon actor and remaining workers: **0.000%**.
+
+There is no demonstrated CPU improvement over the baseline. The difference
+between the summed scheduler runtime and process tick counters is small in
+absolute CPU time and does not affect the under-1% conclusion.
+After pausing and tearing capture down, a ten-second measurement used
+**0.0004%** of one core (0.00% rounded). The isolated daemon was then shut down
+through its own socket; no pre-existing process or live socket was touched.
+
+The strict **under-1% target remains unmet**. Streaming video plus Mesa submission
+alone measured about 1.2% before adding audio and the PipeWire loops. Around
+1.8% is the observed cost at 60 fps on this stack, not a proven irreducible floor.
+These thread totals cannot distinguish individual driver/GStreamer functions
+from the daemon callbacks running on those threads. A local extracted `perf`
+binary could count task time, but the host rejected sampling events (including
+user-only task-clock, cpu-clock and cycles); no system security settings were
+changed. Further attribution requires working function sampling. Reducing the
+capture rate or disabling audio was not used to claim success.
+
+`tests/profile_cpu.py PID --seconds 45` reproduces the read-only thread
+measurement, includes a process-wide `/proc/PID/stat` cross-check, and rejects
+changing thread sets. Run it after the ring fills, without concurrent saves or
+builds. The synthetic source is still unsuitable for hardware CPU measurements.
+
+## Previous-round results
+
 ## Build and automated checks
 
 - `cargo build --release -p clipprd`: passed, no compiler warnings.

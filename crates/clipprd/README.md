@@ -68,6 +68,8 @@ history from the oldest keyframe.
 CARGO_TARGET_DIR=target/daemon cargo test -p clipprd
 CARGO_TARGET_DIR=target/daemon cargo clippy -p clipprd --no-deps -- -D warnings
 python3 crates/clipprd/tests/smoke.py target/daemon/release/clipprd
+# After live capture has filled its ring (percentages are of one CPU core):
+python3 crates/clipprd/tests/profile_cpu.py <daemon-pid> --seconds 45
 ```
 
 The smoke test runs synthetic capture with isolated XDG directories. It checks
@@ -82,5 +84,9 @@ raw frame generator runs on the CPU; its CPU figures do not represent DMA-BUF
 screen capture. For isolated live portal tests, point all four config/state/cache/
 runtime XDG variables at a temporary tree and keep `PIPEWIRE_RUNTIME_DIR` pointed
 at the real session's runtime directory so desktop audio can connect.
+Also isolate `XDG_DATA_HOME` if the standalone desktop-identity fallback must not
+write to the installed applications directory. The running desktop portal reads
+its own data paths, so it will not find a desktop entry created only inside that
+sandbox; shortcut registration requires the normally installed launcher.
 
 See `VALIDATION.md` for the development-machine measurements and remaining limits.

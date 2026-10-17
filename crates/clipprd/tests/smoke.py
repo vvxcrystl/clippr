@@ -32,10 +32,13 @@ with tempfile.TemporaryDirectory(prefix='clipprd-smoke-') as tmp:
     stub_dir.mkdir()
     stub = stub_dir / 'clippr-gui'
     stub.write_text('#!/usr/bin/python3\nimport os,signal\n'
+                    'assert "XDG_ACTIVATION_TOKEN" not in os.environ\n'
+                    'assert "DESKTOP_STARTUP_ID" not in os.environ\n'
                     'open(os.environ["OVERLAY_PID"],"w").write(str(os.getpid()))\n'
                     'signal.pause()\n')
     stub.chmod(0o755)
-    env.update(PATH=str(stub_dir) + ':' + env['PATH'], OVERLAY_PID=str(root / 'overlay.pid'))
+    env.update(PATH=str(stub_dir) + ':' + env['PATH'], OVERLAY_PID=str(root / 'overlay.pid'),
+               XDG_ACTIVATION_TOKEN='stale-daemon-token', DESKTOP_STARTUP_ID='stale-startup-id')
     log = open(root / 'daemon.log', 'w+')
     daemon = subprocess.Popen([str(binary), '--test-source', '--verbose'], env=env, stdout=log, stderr=log)
 

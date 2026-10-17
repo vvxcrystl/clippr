@@ -153,6 +153,8 @@ pub async fn focused(cached: Option<AppInfo>) -> Option<AppInfo> {
 async fn output(program: &str, args: &[&str]) -> Result<String> {
     let result = Command::new(program)
         .args(args)
+        .env_remove("XDG_ACTIVATION_TOKEN")
+        .env_remove("DESKTOP_STARTUP_ID")
         .kill_on_drop(true)
         .output()
         .await?;

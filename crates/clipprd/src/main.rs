@@ -27,7 +27,10 @@ use tracing::{info, warn};
 
 enum Message {
     Request(Box<Request>, oneshot::Sender<Response>),
-    Hotkey(String),
+    Hotkey {
+        id: String,
+        activation_token: Option<String>,
+    },
     Saved(Box<Saved>),
     Shutdown,
 }
@@ -184,7 +187,7 @@ impl Daemon {
             }
         }));
     }
-    async fn toggle_overlay(&mut self) -> Result<()> {
+    async fn toggle_overlay(&mut self, activation_token: Option<&str>) -> Result<()> {
         if let Some(mut child) = self.overlay.take() {
             if child.try_wait()?.is_none() {
                 if let Some(pid) = child.id() {
@@ -211,10 +214,7 @@ impl Daemon {
             "clippr-gui".into()
         };
         self.overlay = Some(
-            tokio::process::Command::new(program)
-                .arg("--overlay")
-                .stdin(std::process::Stdio::null())
-                .kill_on_drop(true)
+            overlay_command(&program, activation_token)
                 .spawn()
                 .context("launching clippr-gui --overlay")?,
         );
@@ -370,7 +370,7 @@ impl Daemon {
                     Response::Ok
                 }
                 Request::ToggleOverlay => {
-                    self.toggle_overlay().await?;
+                    self.toggle_overlay(None).await?;
                     Response::Ok
                 }
                 Request::ResetCaptureSource => {
@@ -409,7 +409,9 @@ async fn main() -> Result<()> {
             "--verbose" | "-v" => verbose = true,
             "--test-source" => test = true,
             "--help" | "-h" => {
-                println!("clipprd [--version] [--verbose] [--test-source]\n--test-source uses synthetic video/audio; never opens the capture picker or binds hotkeys.");
+                println!(
+                    "clipprd [--version] [--verbose] [--test-source]\n--test-source uses synthetic video/audio; never opens the capture picker or binds hotkeys."
+                );
                 return Ok(());
             }
             _ => anyhow::bail!("unknown flag: {arg}"),
@@ -508,10 +510,10 @@ async fn main() -> Result<()> {
                     Request::Save { seconds } => daemon.save(seconds, Some(reply)),
                     req => daemon.request(req, reply).await,
                 },
-                Message::Hotkey(id) => match id.as_str() {
+                Message::Hotkey { id, activation_token } => match id.as_str() {
                     "clip-short" => daemon.save(Some(daemon.config.general.clip_short_secs), None),
                     "clip-long" => daemon.save(Some(daemon.config.general.clip_long_secs), None),
-                    "toggle-overlay" => if let Err(e) = daemon.toggle_overlay().await { warn!(error = %e, "overlay failed"); },
+                    "toggle-overlay" => if let Err(e) = daemon.toggle_overlay(activation_token.as_deref()).await { warn!(error = %e, "overlay failed"); },
                     _ => (),
                 },
                 Message::Saved(saved) => {
@@ -590,6 +592,42 @@ async fn deadline(deadline: Option<Instant>) {
         tokio::time::sleep_until(deadline).await;
     } else {
         std::future::pending::<()>().await;
+    }
+}
+
+fn overlay_command(
+    program: &std::path::Path,
+    activation_token: Option<&str>,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .arg("--overlay")
+        // Startup credentials belong to one activation, never the daemon's lifetime.
+        .env_remove("XDG_ACTIVATION_TOKEN")
+        .env_remove("DESKTOP_STARTUP_ID")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    if let Some(token) = activation_token {
+        command.env("XDG_ACTIVATION_TOKEN", token);
+    }
+    command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_uses_only_the_current_shortcut_activation_token() {
+        for token in [None, Some("current-shortcut-token")] {
+            let command = overlay_command(std::path::Path::new("clippr-gui"), token);
+            let env: std::collections::HashMap<_, _> = command.as_std().get_envs().collect();
+            assert_eq!(
+                env[std::ffi::OsStr::new("XDG_ACTIVATION_TOKEN")],
+                token.map(std::ffi::OsStr::new)
+            );
+            assert_eq!(env[std::ffi::OsStr::new("DESKTOP_STARTUP_ID")], None);
+        }
     }
 }
 

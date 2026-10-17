@@ -5,7 +5,7 @@ use std::{
     process::Command,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Local;
 use clippr_core::{
     clip::{self, AppInfo, ClipMeta},
@@ -70,8 +70,14 @@ fn feed(source: &app::AppSrc, packets: Vec<Packet>, start: u64) {
 
 fn mux(snapshot: Snapshot, path: &Path) -> Result<()> {
     let has_audio = !snapshot.audio.is_empty() && snapshot.audio_caps.is_some();
-    let description = format!("appsrc name=video format=time ! mux.video_0 {} mp4mux name=mux faststart=true ! filesink name=file",
-        if has_audio { "appsrc name=audio format=time ! mux.audio_0" } else { "" });
+    let description = format!(
+        "appsrc name=video format=time ! mux.video_0 {} mp4mux name=mux faststart=true ! filesink name=file",
+        if has_audio {
+            "appsrc name=audio format=time ! mux.audio_0"
+        } else {
+            ""
+        }
+    );
     let pipeline = gst::parse::launch(&description)?
         .downcast::<gst::Pipeline>()
         .map_err(|_| anyhow::anyhow!("mux is not a pipeline"))?;
@@ -220,6 +226,8 @@ pub fn thumbnail(clip: &ClipMeta, config: &Config) -> Result<()> {
     let final_path = paths::thumbs_dir().join(format!("{}.jpg", clip.id));
     let part = final_path.with_extension("jpg.part");
     let status = Command::new("ffmpeg")
+        .env_remove("XDG_ACTIVATION_TOKEN")
+        .env_remove("DESKTOP_STARTUP_ID")
         .args(["-v", "error", "-nostdin", "-y", "-threads", "1", "-ss"])
         .arg((clip.duration_secs / 2.0).min(1.0).to_string())
         .arg("-i")

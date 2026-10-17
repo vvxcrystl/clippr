@@ -2,9 +2,9 @@ use std::{os::fd::OwnedFd, os::unix::fs::OpenOptionsExt};
 
 use anyhow::{Context, Result};
 use ashpd::desktop::{
+    PersistMode, Session, SessionPortal,
     global_shortcuts::{GlobalShortcuts, NewShortcut},
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
-    PersistMode, Session, SessionPortal,
 };
 use clippr_core::{config::Config, paths};
 use futures_util::StreamExt;
@@ -123,7 +123,15 @@ pub async fn hotkeys(config: Config, tx: mpsc::Sender<Message>) -> Result<()> {
     while let Some(event) = activated.next().await {
         if event.session_handle().as_str() == session_path
             && tx
-                .send(Message::Hotkey(event.shortcut_id().to_owned()))
+                .send(Message::Hotkey {
+                    id: event.shortcut_id().to_owned(),
+                    activation_token: event
+                        .options()
+                        .get("activation_token")
+                        .and_then(|value| <&str>::try_from(value).ok())
+                        .filter(|token| !token.is_empty())
+                        .map(str::to_owned),
+                })
                 .await
                 .is_err()
         {

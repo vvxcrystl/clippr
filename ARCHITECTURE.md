@@ -52,8 +52,9 @@ editor export (`edit.rs`) and IPC client (`client.rs`).
    Fallback when VAAPI fails or `encoder = software`: `videoconvert ! videoscale ! x264enc
    speed-preset=superfast tune=zerolatency` (H.264 only), capped CRF via `pass=qual`
    and the same 26/20/16 quality levels, two-second VBV; Custom retains bitrate mode.
-   Preset budgets scale linearly from the 60fps table with configured maximum fps,
-   preserving bits/frame at 30/60/120/144fps. Resolution and capture rate are unchanged.
+   Preset budgets come from a 60fps table: lower capture rates scale down to keep bits per
+   frame, and rates above 60 stay at the 60fps cap so high-fps clips never outgrow the old
+   fixed bitrate. Resolution and capture rate are unchanged.
    Framerate cap via caps on the
    PipeWire stream (`max-framerate`), not a `videorate` element.
 3. **Audio.** Desktop audio from the default sink monitor, optional mic from the default (or

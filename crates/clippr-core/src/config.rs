@@ -223,7 +223,9 @@ impl Config {
     /// input. Custom is the user's unscaled bitrate, independent of codec and fps.
     /// VA drivers can overshoot this nominal budget; it is not a memory limit.
     pub fn video_bitrate_kbps(&self, height: u32) -> u32 {
-        // The table is a 60fps budget; preserve bits/frame at other capture rates.
+        // The table is a 60fps budget. Lower rates keep the same bits per frame; higher rates
+        // stay at the 60fps cap so high-fps clips are never bigger than before. VBR with a
+        // quantizer floor already spends far less than the cap on most content.
         let base = match height {
             0..=720 => 6_000u32,
             721..=1080 => 10_000,
@@ -240,7 +242,7 @@ impl Config {
             crate::config::Codec::H264 => scaled,
             _ => scaled * 7 / 10,
         };
-        (u64::from(scaled) * u64::from(self.video.fps.clamp(1, 240)) / 60).clamp(500, 200_000)
+        (u64::from(scaled) * u64::from(self.video.fps.clamp(1, 60)) / 60).clamp(500, 200_000)
             as u32
     }
 }
@@ -250,14 +252,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preset_budgets_scale_with_fps_but_custom_does_not() {
+    fn preset_budgets_scale_down_with_fps_but_cap_at_60_and_custom_does_not() {
         let mut config = Config::default();
-        for (fps, budget) in [(30, 5_000), (60, 10_000), (120, 20_000), (144, 24_000)] {
+        for (fps, budget) in [(30, 5_000), (60, 10_000), (120, 10_000), (144, 10_000)] {
             config.video.fps = fps;
             assert_eq!(config.video_bitrate_kbps(1080), budget);
         }
         config.video.codec = Codec::Av1;
-        assert_eq!(config.video_bitrate_kbps(1080), 16_800);
+        assert_eq!(config.video_bitrate_kbps(1080), 7_000);
         config.video.quality = Quality::Custom;
         config.video.bitrate_kbps = 12_345;
         assert_eq!(config.video_bitrate_kbps(1080), 12_345);

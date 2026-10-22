@@ -14,8 +14,8 @@ in RAM, and the recorder has no polling loops. The GUI only runs while you have 
 
 ## Features
 
-- Save the last 30 seconds (F8), the last minute (Shift+F8), or any length from the overlay or CLI.
-  Both lengths are configurable.
+- Save the last 30 seconds with F8 by default. Add shortcuts with their own durations in Settings,
+  such as F9 for 45 seconds or F7 for 5 minutes. The overlay and CLI also accept custom lengths.
 - H.264, HEVC or AV1 through VAAPI, with an x264 fallback. Quality presets or a custom bitrate,
   plus a resolution and frame-rate cap. Desktop audio and an optional microphone.
 - A "Clip saved" popup in the screen corner with the clip's thumbnail and length. It draws above fullscreen games without taking focus.

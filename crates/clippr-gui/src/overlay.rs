@@ -57,14 +57,8 @@ pub fn build(app: &adw::Application, state: &Rc<State>) -> adw::ApplicationWindo
     header.append(&close);
 
     // Clip buttons
-    let clip_short = gtk::Button::new();
-    clip_short.add_css_class("suggested-action");
-    clip_short.add_css_class("clip-button");
-    let clip_long = gtk::Button::new();
-    clip_long.add_css_class("clip-button");
-    let clip_row = gtk::Box::builder().spacing(8).homogeneous(true).build();
-    clip_row.append(&clip_short);
-    clip_row.append(&clip_long);
+    let toasts = adw::ToastOverlay::new();
+    let clip_row = crate::clip_buttons::build(state, &toasts, "clip-button");
 
     let custom_secs = gtk::SpinButton::with_range(1.0, 600.0, 5.0);
     custom_secs.set_value(15.0);
@@ -164,7 +158,6 @@ pub fn build(app: &adw::Application, state: &Rc<State>) -> adw::ApplicationWindo
     root.append(&body);
     root.append(&footer);
 
-    let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&root));
     window.set_content(Some(&toasts));
 
@@ -174,8 +167,7 @@ pub fn build(app: &adw::Application, state: &Rc<State>) -> adw::ApplicationWindo
         let state = state.clone();
         let syncing = syncing.clone();
         let (dot, state_label, buffered, body) = (dot.clone(), state_label.clone(), buffered.clone(), body.clone());
-        let (clip_short, clip_long, custom_secs, custom_clip) =
-            (clip_short.clone(), clip_long.clone(), custom_secs.clone(), custom_clip.clone());
+        let (custom_secs, custom_clip) = (custom_secs.clone(), custom_clip.clone());
         let (pause, desktop, mic, quality) = (pause.clone(), desktop.clone(), mic.clone(), quality.clone());
         move || {
             let status = state.status();
@@ -186,8 +178,8 @@ pub fn build(app: &adw::Application, state: &Rc<State>) -> adw::ApplicationWindo
             buffered.set_label(&match &status {
                 Some(s) if s.state == CaptureState::Recording => format!(
                     "{:.0} of {} s buffered",
-                    s.buffered_secs.min(cfg.general.buffer_secs() as f32),
-                    cfg.general.buffer_secs() - 2
+                    s.buffered_secs.min(cfg.longest_clip_secs() as f32),
+                    cfg.longest_clip_secs()
                 ),
                 Some(s) => util::status_line(s),
                 None => String::new(),
@@ -195,14 +187,8 @@ pub fn build(app: &adw::Application, state: &Rc<State>) -> adw::ApplicationWindo
             buffered.set_visible(status.is_some());
 
             let recording = matches!(status.as_ref().map(|s| s.state), Some(CaptureState::Recording));
-            clip_short.set_label(&format!("Clip {}", util::clip_length(cfg.general.clip_short_secs)));
-            clip_long.set_label(&format!("Clip {}", util::clip_length(cfg.general.clip_long_secs)));
-            clip_short.set_tooltip_text(Some(&cfg.hotkeys.clip_short));
-            clip_long.set_tooltip_text(Some(&cfg.hotkeys.clip_long));
-            for b in [&clip_short, &clip_long, &custom_clip] {
-                b.set_sensitive(recording);
-            }
-            let max = (cfg.general.buffer_secs() - 2) as f64;
+            custom_clip.set_sensitive(recording);
+            let max = (cfg.longest_clip_secs()) as f64;
             custom_secs.set_range(1.0, max);
 
             syncing.set(true);
@@ -252,14 +238,6 @@ pub fn build(app: &adw::Application, state: &Rc<State>) -> adw::ApplicationWindo
             });
         })
     };
-    {
-        let (save, state) = (save.clone(), state.clone());
-        clip_short.connect_clicked(move |b| save(state.config().general.clip_short_secs, b.clone()));
-    }
-    {
-        let (save, state) = (save.clone(), state.clone());
-        clip_long.connect_clicked(move |b| save(state.config().general.clip_long_secs, b.clone()));
-    }
     {
         let save = save.clone();
         let custom_secs = custom_secs.clone();

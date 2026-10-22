@@ -1,6 +1,6 @@
 //! User configuration, stored as TOML at [`crate::paths::config_file`].
 //!
-//! Every field has a default, so a partial or missing file loads cleanly.
+//! Omitted settings use defaults, so a partial or missing file loads cleanly.
 
 use std::{io::Write, path::PathBuf};
 
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub const KEYFRAME_INTERVAL_SECS: u32 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "StoredConfig")]
 pub struct Config {
     pub general: General,
     pub video: Video,
@@ -23,23 +23,10 @@ pub struct Config {
 pub struct General {
     /// Where finished clips and their sidecars are written.
     pub clips_dir: PathBuf,
-    /// Length saved by the primary clip hotkey, in seconds.
-    pub clip_short_secs: u32,
-    /// Length saved by the secondary clip hotkey, in seconds.
-    pub clip_long_secs: u32,
     /// Show a desktop notification after a clip is saved.
     pub notify_on_save: bool,
     /// Start capturing as soon as the daemon starts. When false the daemon idles until resumed.
     pub start_recording: bool,
-}
-
-impl General {
-    /// Keep a whole GOP before the requested start, plus one second for stream skew.
-    pub fn buffer_secs(&self) -> u32 {
-        self.clip_short_secs
-            .max(self.clip_long_secs)
-            .saturating_add(KEYFRAME_INTERVAL_SECS + 1)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +121,27 @@ pub struct Audio {
     /// PipeWire node name for the microphone. `None` means the default source.
     pub mic_device: Option<String>,
     pub bitrate_kbps: u32,
+    pub levels: AudioLevels,
+}
+
+/// Default volume of each source in the saved mix, in percent. Only clips with separate
+/// tracks have sources to balance. Each saved clip keeps the gains used for its mix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioLevels {
+    pub game: u32,
+    pub mic: u32,
+    pub voice: u32,
+}
+
+impl Default for AudioLevels {
+    fn default() -> Self {
+        Self {
+            game: 100,
+            mic: 100,
+            voice: 100,
+        }
+    }
 }
 
 /// Preferred key combinations, in xdg-desktop-portal GlobalShortcuts trigger syntax
@@ -141,17 +149,150 @@ pub struct Audio {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Hotkeys {
-    pub clip_short: String,
-    pub clip_long: String,
+    pub clips: Vec<ClipBinding>,
     pub toggle_overlay: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipBinding {
+    pub trigger: String,
+    pub seconds: u32,
+}
+
+impl ClipBinding {
+    /// Use the trigger as identity so removing a row cannot move desktop overrides
+    /// or an already queued activation onto another binding.
+    pub fn shortcut_id(&self) -> String {
+        format!("save-{}", self.trigger)
+    }
+}
+
+impl Hotkeys {
+    pub fn clip_seconds(&self, shortcut_id: &str) -> Option<u32> {
+        self.clips
+            .iter()
+            .find(|binding| binding.shortcut_id() == shortcut_id)
+            .map(|binding| binding.seconds)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let mut triggers = std::collections::HashSet::new();
+        triggers.insert(normalize_trigger(&self.toggle_overlay)?.to_ascii_lowercase());
+        for binding in &self.clips {
+            anyhow::ensure!(
+                (1..=3600).contains(&binding.seconds),
+                "clip lengths must be between 1 and 3600 seconds"
+            );
+            let trigger = normalize_trigger(&binding.trigger)?;
+            anyhow::ensure!(
+                triggers.insert(trigger.to_ascii_lowercase()),
+                "shortcut {trigger} is already used"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// XDG shortcut syntax. Preserve case-sensitive XKB key names such as `Return`.
+pub fn normalize_trigger(trigger: &str) -> anyhow::Result<String> {
+    const MODIFIERS: [&str; 5] = ["CTRL", "ALT", "SHIFT", "NUM", "LOGO"];
+    let mut parts: Vec<_> = trigger.trim().split('+').collect();
+    let key = parts.pop().unwrap_or_default();
+    anyhow::ensure!(
+        !key.is_empty() && key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'),
+        "enter a shortcut such as F8 or CTRL+SHIFT+F8"
+    );
+    let mut modifiers = Vec::new();
+    for part in parts {
+        let modifier = part.to_ascii_uppercase();
+        let index = MODIFIERS.iter().position(|m| *m == modifier);
+        let index = index.ok_or_else(|| anyhow::anyhow!("unknown shortcut modifier: {part}"))?;
+        anyhow::ensure!(!modifiers.contains(&index), "duplicate modifier: {part}");
+        modifiers.push(index);
+    }
+    modifiers.sort_unstable();
+    let mut normalized: Vec<_> = modifiers
+        .into_iter()
+        .map(|i| MODIFIERS[i].to_owned())
+        .collect();
+    let key = if key.starts_with(['f', 'F']) && key[1..].parse::<u8>().is_ok() {
+        key.to_ascii_uppercase()
+    } else {
+        key.to_owned()
+    };
+    normalized.push(key);
+    Ok(normalized.join("+"))
+}
+
+// Old files and IPC configs used two fixed hotkeys, with durations in [general].
+// Read those at the boundary; only the new binding list is written back.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct StoredConfig {
+    general: StoredGeneral,
+    video: Video,
+    audio: Audio,
+    hotkeys: StoredHotkeys,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct StoredGeneral {
+    #[serde(flatten)]
+    general: General,
+    clip_short_secs: Option<u32>,
+    clip_long_secs: Option<u32>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct StoredHotkeys {
+    clips: Option<Vec<ClipBinding>>,
+    clip_short: Option<String>,
+    clip_long: Option<String>,
+    toggle_overlay: Option<String>,
+}
+
+impl From<StoredConfig> for Config {
+    fn from(stored: StoredConfig) -> Self {
+        let mut hotkeys = Hotkeys::default();
+        if let Some(clips) = stored.hotkeys.clips {
+            hotkeys.clips = clips;
+        } else if stored.hotkeys.clip_short.is_some()
+            || stored.hotkeys.clip_long.is_some()
+            || stored.general.clip_short_secs.is_some()
+            || stored.general.clip_long_secs.is_some()
+        {
+            hotkeys.clips = vec![
+                ClipBinding {
+                    trigger: stored.hotkeys.clip_short.unwrap_or_else(|| "F8".into()),
+                    seconds: stored.general.clip_short_secs.unwrap_or(30),
+                },
+                ClipBinding {
+                    trigger: stored
+                        .hotkeys
+                        .clip_long
+                        .unwrap_or_else(|| "SHIFT+F8".into()),
+                    seconds: stored.general.clip_long_secs.unwrap_or(60),
+                },
+            ];
+        }
+        if let Some(trigger) = stored.hotkeys.toggle_overlay {
+            hotkeys.toggle_overlay = trigger;
+        }
+        Self {
+            general: stored.general.general,
+            video: stored.video,
+            audio: stored.audio,
+            hotkeys,
+        }
+    }
 }
 
 impl Default for General {
     fn default() -> Self {
         Self {
             clips_dir: crate::paths::default_clips_dir(),
-            clip_short_secs: 30,
-            clip_long_secs: 60,
             notify_on_save: true,
             start_recording: true,
         }
@@ -193,6 +334,7 @@ impl Default for Audio {
             .collect(),
             mic_device: None,
             bitrate_kbps: 160,
+            levels: AudioLevels::default(),
         }
     }
 }
@@ -200,19 +342,59 @@ impl Default for Audio {
 impl Default for Hotkeys {
     fn default() -> Self {
         Self {
-            clip_short: "F8".into(),
-            clip_long: "SHIFT+F8".into(),
+            clips: vec![ClipBinding {
+                trigger: "F8".into(),
+                seconds: 30,
+            }],
             toggle_overlay: "ALT+F8".into(),
         }
     }
 }
 
 impl Config {
+    /// CLI saves and the primary clip button use the first binding, or 30 seconds
+    /// when all save hotkeys have been removed.
+    pub fn default_clip_secs(&self) -> u32 {
+        self.hotkeys
+            .clips
+            .first()
+            .map_or(30, |binding| binding.seconds)
+    }
+
+    pub fn longest_clip_secs(&self) -> u32 {
+        self.hotkeys
+            .clips
+            .iter()
+            .map(|binding| binding.seconds)
+            .max()
+            .unwrap_or(30)
+    }
+
+    /// Keep a whole GOP before the requested start, plus one second for stream skew.
+    pub fn buffer_secs(&self) -> u32 {
+        self.longest_clip_secs()
+            .saturating_add(KEYFRAME_INTERVAL_SECS + 1)
+    }
+
+    /// Whether moving from `self` to `new` needs a capture rebuild. Levels only shape
+    /// the mix built on save, so changing them keeps the replay buffer.
+    pub fn needs_capture_restart(&self, new: &Config) -> bool {
+        let audio = Audio {
+            levels: self.audio.levels,
+            ..new.audio.clone()
+        };
+        new.video != self.video || audio != self.audio
+    }
+
     /// Load from [`crate::paths::config_file`]. A missing file yields defaults.
     pub fn load() -> anyhow::Result<Self> {
         let path = crate::paths::config_file();
         match std::fs::read_to_string(&path) {
-            Ok(text) => Ok(toml::from_str(&text)?),
+            Ok(text) => {
+                let config: Self = toml::from_str(&text)?;
+                config.hotkeys.validate()?;
+                Ok(config)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
         }
@@ -224,6 +406,7 @@ impl Config {
     }
 
     fn save_to(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.hotkeys.validate()?;
         let dir = path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("config has no parent"))?;
@@ -269,6 +452,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clip_bindings_default_migrate_and_roundtrip() -> anyhow::Result<()> {
+        let defaults: Config = toml::from_str("")?;
+        assert_eq!(
+            defaults.hotkeys.clips,
+            [ClipBinding {
+                trigger: "F8".into(),
+                seconds: 30
+            }]
+        );
+        assert_eq!(defaults.buffer_secs(), 33);
+        let old: Config = toml::from_str(
+            r#"
+            [general]
+            clip_short_secs = 45
+            clip_long_secs = 300
+            notify_on_save = false
+            [hotkeys]
+            clip_short = "F9"
+            clip_long = "F7"
+        "#,
+        )?;
+        assert!(!old.general.notify_on_save);
+        assert_eq!(old.hotkeys.clips[0].trigger, "F9");
+        assert_eq!(old.default_clip_secs(), 45);
+        assert_eq!(old.hotkeys.clips[1].trigger, "F7");
+        assert_eq!(old.buffer_secs(), 303);
+        let text = toml::to_string_pretty(&old)?;
+        assert!(!text.contains("clip_short"));
+        assert_eq!(toml::from_str::<Config>(&text)?, old);
+        assert_eq!(
+            serde_json::from_value::<Config>(serde_json::to_value(&old)?)?,
+            old
+        );
+        let empty: Config = toml::from_str("[hotkeys]\nclips = []\n")?;
+        assert!(empty.hotkeys.clips.is_empty());
+        assert_eq!(empty.default_clip_secs(), 30);
+        assert_eq!(empty.buffer_secs(), 33);
+        Ok(())
+    }
+
+    #[test]
+    fn custom_clip_bindings_validate_and_keep_their_identity() -> anyhow::Result<()> {
+        let mut config = Config::default();
+        config.hotkeys.clips.extend([
+            ClipBinding {
+                trigger: "F9".into(),
+                seconds: 45,
+            },
+            ClipBinding {
+                trigger: "F7".into(),
+                seconds: 300,
+            },
+        ]);
+        config.hotkeys.validate()?;
+        assert_eq!(config.buffer_secs(), 303);
+        let id = config.hotkeys.clips[2].shortcut_id();
+        let removed_id = config.hotkeys.clips[1].shortcut_id();
+        assert_eq!(config.hotkeys.clip_seconds(&removed_id), Some(45));
+        config.hotkeys.clips.remove(1);
+        assert_eq!(config.hotkeys.clips[1].shortcut_id(), id);
+        assert_eq!(config.hotkeys.clip_seconds(&id), Some(300));
+        assert_eq!(config.hotkeys.clip_seconds(&removed_id), None);
+        assert!(!Config::default().needs_capture_restart(&config));
+        for seconds in [0, 3601, u32::MAX] {
+            config.hotkeys.clips[1].seconds = seconds;
+            assert!(config.hotkeys.validate().is_err());
+        }
+        config.hotkeys.clips[1].seconds = 300;
+        config.hotkeys.clips[1].trigger = "alt+f8".into();
+        assert!(config.hotkeys.validate().is_err());
+        config.hotkeys.clips[1].trigger = "shift+ctrl+F9".into();
+        config.hotkeys.clips[0].trigger = "CTRL+SHIFT+f9".into();
+        assert!(config.hotkeys.validate().is_err());
+        assert_eq!(normalize_trigger("shift+ctrl+Return")?, "CTRL+SHIFT+Return");
+        for trigger in ["", "CTRL+", "CTRL+CTRL+F8", "F8+F9", "<Control>F8"] {
+            assert!(normalize_trigger(trigger).is_err(), "{trigger}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn preset_budgets_scale_down_with_fps_but_cap_at_60_and_custom_does_not() {
         let mut config = Config::default();
         for (fps, budget) in [(30, 5_000), (60, 10_000), (120, 10_000), (144, 10_000)] {
@@ -287,7 +551,7 @@ mod tests {
     fn old_partial_configs_keep_defaults_and_quality_order() -> anyhow::Result<()> {
         let mut config: Config = toml::from_str("[video]\nfps = 120\n")?;
         assert_eq!(config.video.codec, Codec::H264);
-        assert_eq!(config.general.buffer_secs(), 63);
+        assert_eq!(config.buffer_secs(), 33);
         let mut previous = (u32::MAX, 0);
         for quality in [Quality::Low, Quality::Medium, Quality::High] {
             config.video.quality = quality;
@@ -309,7 +573,7 @@ mod tests {
                     let path = &path;
                     scope.spawn(move || {
                         let mut config = Config::default();
-                        config.hotkeys.clip_short = format!("F{i}");
+                        config.hotkeys.clips[0].trigger = format!("F{i}");
                         config.save_to(path)
                     })
                 })
@@ -319,7 +583,7 @@ mod tests {
             }
         });
         let config: Config = toml::from_str(&std::fs::read_to_string(path)?)?;
-        assert!(config.hotkeys.clip_short.starts_with('F'));
+        assert!(config.hotkeys.clips[0].trigger.starts_with('F'));
         assert_eq!(std::fs::read_dir(dir.path())?.count(), 1);
         Ok(())
     }

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -28,14 +29,19 @@ with tempfile.TemporaryDirectory(prefix='clipprd-smoke-') as tmp:
     config_dir = root / 'config/clippr'
     config_dir.mkdir(parents=True)
     (config_dir / 'config.toml').write_text(
-        f'[general]\nclips_dir = "{tmp}/clips"\nclip_short_secs = 5\n'
-        'clip_long_secs = 8\nnotify_on_save = false\n'
+        f'[general]\nclips_dir = "{tmp}/clips"\nnotify_on_save = false\n'
+        '[hotkeys]\nclips = [{ trigger = "F8", seconds = 5 }, { trigger = "F9", seconds = 8 }]\n'
         f'[video]\nfps = {fps}\nresolution = "{resolution}"\n'
         + ('encoder = "software"\n' if software_only else '')
         + '[audio]\ncapture_mic = true\n')
     # The stub tests child spawning, SIGTERM and reaping without starting the GUI.
     stub_dir = root / 'bin'
     stub_dir.mkdir()
+    # A workspace build may put the real GUI beside clipprd. Copy this test's
+    # daemon beside its stub so current_exe cannot select that GUI instead.
+    isolated_binary = stub_dir / 'clipprd'
+    shutil.copy2(binary, isolated_binary)
+    binary = isolated_binary
     stub = stub_dir / 'clippr-gui'
     stub.write_text('#!/usr/bin/python3\nimport os,signal\n'
                     'assert "XDG_ACTIVATION_TOKEN" not in os.environ\n'
@@ -90,11 +96,13 @@ with tempfile.TemporaryDirectory(prefix='clipprd-smoke-') as tmp:
             s.sendall(b'x' * (1024 * 1024 + 1))
             assert json.loads(s.makefile('rb').readline())['type'] == 'error'
 
-        def save_and_probe(seconds, codec):
-            clip = request({'cmd': 'save', 'seconds': seconds})['clip']
+        def save_and_probe(seconds, codec, default=False):
+            clip = request({'cmd': 'save', 'seconds': None if default else seconds})['clip']
             path = root / 'clips' / clip['file']
             probe = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(path)]))
             settings = request({'cmd': 'get_config'})['config']['audio']
+            if settings['separate_tracks']:
+                assert {g['kind']: g['gain'] for g in clip['mix_gains']} == {'desktop': settings['levels']['game'] / 100, 'mic': settings['levels']['mic'] / 100, 'voice': settings['levels']['voice'] / 100}
             kinds = ['mix'] if settings['capture_desktop'] or settings['capture_mic'] else []
             if settings['separate_tracks'] and kinds:
                 kinds += (['desktop'] if settings['capture_desktop'] else []) + (['mic'] if settings['capture_mic'] else []) + (['voice'] if settings['capture_desktop'] else [])
@@ -127,7 +135,14 @@ with tempfile.TemporaryDirectory(prefix='clipprd-smoke-') as tmp:
             return clip
 
         time.sleep(8)
-        first = save_and_probe(5, 'h264')
+        first = save_and_probe(5, 'h264', default=True)
+        config = request({'cmd': 'get_config'})['config']
+        config['hotkeys']['clips'].append({'trigger': 'F7', 'seconds': 300})
+        request({'cmd': 'set_config', 'config': config})
+        assert request({'cmd': 'get_config'})['config']['hotkeys']['clips'][-1]['seconds'] == 300
+        assert request({'cmd': 'status'})['status']['buffered_secs'] >= 7
+        # Changing the longest binding preserves already buffered history.
+        save_and_probe(8, 'h264')
         while True:
             event = json.loads(event_file.readline())['event']
             if event['kind'] == 'clip_saved':

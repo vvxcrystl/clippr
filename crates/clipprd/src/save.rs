@@ -220,7 +220,10 @@ pub fn save(
             if separate {
                 cmd.args([
                     "-filter_complex",
-                    &clippr_core::audio::mix_filter(&input_tracks, &[])?,
+                    &clippr_core::audio::mix_filter(
+                        &input_tracks,
+                        &config.audio.levels.gains(),
+                    )?,
                     "-map",
                     "0:v:0",
                     "-map",
@@ -287,6 +290,7 @@ pub fn save(
             tags: vec![],
             edited_from: None,
             audio_tracks,
+            mix_gains: if config.audio.separate_tracks { config.audio.levels.gains() } else { vec![] },
         };
         let sidecar = dir.join(format!("{id}.json"));
         let tmp = dir.join(format!("{id}.json.part"));

@@ -292,6 +292,7 @@ pub(crate) fn probe(path: &Path, id: &str) -> anyhow::Result<ClipMeta> {
         favorite: false,
         tags: vec![],
         edited_from: None,
+        mix_gains: vec![],
         audio_tracks: value["streams"]
             .as_array()
             .into_iter()

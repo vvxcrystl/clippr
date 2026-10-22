@@ -377,11 +377,7 @@ pub fn validate_config(config: &clippr_core::config::Config) -> Result<()> {
         (1..=240).contains(&config.video.fps),
         "video.fps must be between 1 and 240"
     );
-    anyhow::ensure!(
-        (1..=3600).contains(&config.general.clip_short_secs)
-            && (1..=3600).contains(&config.general.clip_long_secs),
-        "clip lengths must be between 1 and 3600 seconds"
-    );
+    config.hotkeys.validate()?;
     anyhow::ensure!(
         (8..=512).contains(&config.audio.bitrate_kbps),
         "audio bitrate must be between 8 and 512 kbps"

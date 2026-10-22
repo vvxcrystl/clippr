@@ -23,8 +23,8 @@ editor export (`edit.rs`) and IPC client (`client.rs`).
 - CPU while recording: under 1% of one core on a modern desktop. The frame path must stay on
   the GPU: PipeWire DMA-BUF in, VAAPI scale/convert, VAAPI encode, encoded bytes out. No raw
   frame may be copied to system memory on the hardware path.
-- RAM: the ring buffer of encoded packets plus under 40 MB of process overhead. 63s of
-  1440p60 H.264 at the 16 Mbps preset budget is about 126 MB; easy scenes use less.
+- RAM: the ring buffer of encoded packets plus under 40 MB of process overhead. 33s of
+  1440p60 H.264 at the 16 Mbps preset budget is about 66 MB; easy scenes use less.
   VA rate control is a nominal budget, not a strict byte limit (see codec validation).
 - GPU: one hardware encode session. No shaders beyond `vapostproc`.
 - Idle wakeups: no polling loops. Everything is event driven (GStreamer bus, D-Bus signals,
@@ -88,7 +88,7 @@ editor export (`edit.rs`) and IPC client (`client.rs`).
    PTS, duration, keyframe flag). Encoders output presentation order, so DTS equals PTS;
    enabling reordering would require redesigning discontinuity detection, trimming and muxing.
    Trim from the front by PTS so the buffer holds
-   `General::buffer_secs()` of video (longest clip + GOP duration + one second of
+   `Config::buffer_secs()` of video (longest clip + GOP duration + one second of
    stream-skew slack). Trimming keeps the oldest retained video sample a
    keyframe. One AAC deque per enabled source is trimmed against that same video
    boundary; snapshots select every track against a common start/end. A timestamp
@@ -99,7 +99,8 @@ editor export (`edit.rs`) and IPC client (`client.rs`).
    align audio by PTS, rebase timestamps to zero,
    write `appsrc → mp4mux → filesink` into a temporary source-track MP4. On this
    low-priority save thread, FFmpeg decodes those buffered AAC tracks, aligns initial
-   gaps, sums them and encodes Mix once at the configured bitrate. Video and source
+   gaps, scales each by `audio.levels` (percent), sums them and encodes Mix once at
+   the configured bitrate. Changing levels does not restart capture. Video and source
    AAC are stream-copied into the final faststart MP4, in audio order **Mix, Game,
    Microphone, Voice chat**, omitting disabled sources. Mix alone is the default
    audio stream, with readable MP4 titles and handler names on every track. The
@@ -120,8 +121,12 @@ editor export (`edit.rs`) and IPC client (`client.rs`).
    - Otherwise `None`.
    Resolve a friendly name: `steam_app_<n>` → read the game name from Steam's appmanifest if
    available, otherwise the class; read `/proc/<pid>/comm` as a last resort.
-8. **Hotkeys.** xdg-desktop-portal GlobalShortcuts (`ashpd`), ids `clip-short`, `clip-long`,
-   `toggle-overlay`, preferred triggers from `config.hotkeys`. If the portal is unavailable,
+8. **Hotkeys.** xdg-desktop-portal GlobalShortcuts (`ashpd`), one `save-<trigger>` id per
+   `config.hotkeys.clips` entry (`trigger`, `seconds`) plus `toggle-overlay`. F8 saves 30 seconds
+   by default. Legacy short/long configs migrate on read. The longest binding sizes the ring,
+   and changing bindings resizes it without restarting capture. Trigger-based ids keep desktop
+   overrides and queued activations from moving to another row when a binding is removed.
+   If the portal is unavailable,
    log it and rely on the CLI (`clippr save`, `clippr overlay`) bound in the compositor.
 9. **Errors.** Pipeline errors set `CaptureState::Error` + `last_error`, then retry with
    backoff (2s, 5s, 15s, then every 60s). Hardware encoder failure falls back to software
@@ -151,8 +156,11 @@ shared H.264 bitrate/VBV budget. `trim`/`atrim` + `concat` filters preserve prec
 Progress comes from `-progress pipe:1`.
 
 All audio streams are retained in both modes. `ExportRequest::track_gains` changes
-only Mix: when any gain differs from one, rebuild it from the cut source tracks,
-leaving source-track volumes unchanged. Fast exports still stream-copy video and
+only Mix: when a requested gain differs from the saved gain, rebuild it from the
+cut source tracks, leaving source-track volumes unchanged. Clip sidecars retain `mix_gains`, the source gains
+used for the saved Mix. The editor reads these rather than current recorder defaults;
+legacy clips without the field use unity. Exports retain these gains and rebuild Mix
+when a requested gain differs, including a reset to unity. Fast exports still stream-copy video and
 source AAC; only Mix is encoded. Precise exports trim/concatenate every audio stream
 and re-encode AAC for the precise cut, then rebuild Mix if requested. Legacy single
 tracks accept Mix or Desktop gain. Nonfinite/negative and duplicate gains are rejected.
@@ -161,8 +169,9 @@ Cancellation applies to cutting and remixing, and temporary files roll back toge
 The additive shared contract is:
 
 ```rust
-Audio { separate_tracks: bool, voice_apps: Vec<String>, /* existing fields */ }
-ClipMeta { audio_tracks: Vec<AudioTrack>, /* existing fields */ }
+Audio { separate_tracks: bool, voice_apps: Vec<String>, levels: AudioLevels, /* existing fields */ }
+pub struct AudioLevels { pub game: u32, pub mic: u32, pub voice: u32 } // percent, default 100
+ClipMeta { audio_tracks: Vec<AudioTrack>, mix_gains: Vec<TrackGain>, /* existing fields */ }
 pub struct AudioTrack { pub index: u32, pub kind: AudioTrackKind, pub label: String }
 pub enum AudioTrackKind { Mix, Desktop, Mic, Voice } // snake_case serde
 ExportRequest { track_gains: Vec<TrackGain>, /* existing fields */ }

@@ -86,7 +86,16 @@ pub fn export(
         tracks.iter().enumerate().all(|(i, t)| t.index == i as u32),
         "invalid audio track indices"
     );
-    let remix = !tracks.is_empty() && req.track_gains.iter().any(|g| g.gain != 1.0);
+    crate::audio::validate_gains(&source.mix_gains)?;
+    let mut mix_gains = source.mix_gains.clone();
+    for gain in &req.track_gains {
+        if let Some(existing) = mix_gains.iter_mut().find(|g| g.kind == gain.kind) {
+            *existing = gain.clone();
+        } else {
+            mix_gains.push(gain.clone());
+        }
+    }
+    let remix = !tracks.is_empty() && req.track_gains.iter().any(|g| g.gain != source.mix_gain(g.kind));
     let output_tracks = if remix && tracks.len() > 1 && tracks[0].kind != AudioTrackKind::Mix {
         std::iter::once(AudioTrack::new(0, AudioTrackKind::Mix))
             .chain(tracks.iter().enumerate().map(|(i, t)| AudioTrack {
@@ -244,7 +253,7 @@ pub fn export(
         let mut cmd = ffmpeg();
         cmd.arg("-i").arg(&cut).args([
             "-filter_complex",
-            &crate::audio::mix_filter(&tracks, &req.track_gains)?,
+            &crate::audio::mix_filter(&tracks, &mix_gains)?,
             "-map",
             "0:v:0",
             "-map",
@@ -296,6 +305,7 @@ pub fn export(
     };
     let mut clip = probe(&output, &id)?;
     clip.audio_tracks = output_tracks;
+    clip.mix_gains = mix_gains;
     clip.title = req.title.clone();
     clip.app = source.app.clone();
     clip.tags = source.tags.clone();

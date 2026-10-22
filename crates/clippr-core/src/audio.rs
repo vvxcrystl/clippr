@@ -3,7 +3,7 @@ use anyhow::{ensure, Result};
 
 use crate::{
     clip::{AudioTrack, AudioTrackKind},
-    config::Audio,
+    config::{Audio, AudioLevels},
     edit::TrackGain,
 };
 
@@ -53,6 +53,29 @@ impl Audio {
     }
 }
 
+impl AudioLevels {
+    /// Percent for a source track; Mix is never scaled by default.
+    pub fn percent(&self, kind: AudioTrackKind) -> u32 {
+        match kind {
+            AudioTrackKind::Mix => 100,
+            AudioTrackKind::Desktop => self.game,
+            AudioTrackKind::Mic => self.mic,
+            AudioTrackKind::Voice => self.voice,
+        }
+    }
+
+    /// Linear gains for [`mix_filter`].
+    pub fn gains(&self) -> Vec<TrackGain> {
+        [AudioTrackKind::Desktop, AudioTrackKind::Mic, AudioTrackKind::Voice]
+            .into_iter()
+            .map(|kind| TrackGain {
+                kind,
+                gain: self.percent(kind) as f32 / 100.0,
+            })
+            .collect()
+    }
+}
+
 pub fn validate_gains(gains: &[TrackGain]) -> Result<()> {
     for (i, gain) in gains.iter().enumerate() {
         ensure!(
@@ -85,7 +108,7 @@ pub fn mix_filter(tracks: &[AudioTrack], gains: &[TrackGain]) -> Result<String> 
     };
     let mut filter = String::new();
     for (i, track) in sources.iter().enumerate() {
-        let amplitude = if tracks.len() == 1 {
+        let amplitude = if tracks.len() == 1 && track.kind == AudioTrackKind::Mix {
             // Legacy clips have one combined track, also addressable as Desktop.
             gains
                 .iter()
@@ -153,4 +176,28 @@ mod tests {
         audio.capture_mic = false;
         assert!(audio.source_tracks().is_empty());
     }
+
+    #[test]
+    fn levels_shape_the_mix_without_restarting_capture() -> Result<()> {
+        let levels = AudioLevels { game: 60, mic: 150, voice: 100 };
+        let tracks = [
+            AudioTrack::new(0, AudioTrackKind::Desktop),
+            AudioTrack::new(1, AudioTrackKind::Mic),
+        ];
+        let filter = mix_filter(&tracks, &levels.gains())?;
+        assert!(filter.contains("[0:a:0]") && filter.contains("volume=0.6["), "{filter}");
+        assert!(filter.contains("volume=1.5["), "{filter}");
+        // A lone source track takes its own level, not the legacy Mix/Desktop alias.
+        let filter = mix_filter(&tracks[1..], &levels.gains())?;
+        assert!(filter.contains("volume=1.5["), "{filter}");
+
+        let old = crate::config::Config::default();
+        let mut new = old.clone();
+        new.audio.levels = levels;
+        assert!(!old.needs_capture_restart(&new));
+        new.audio.capture_mic = !new.audio.capture_mic;
+        assert!(old.needs_capture_restart(&new));
+        Ok(())
+    }
+
 }

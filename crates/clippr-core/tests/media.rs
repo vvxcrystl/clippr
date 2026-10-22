@@ -467,6 +467,26 @@ fn multitrack_exports_preserve_sources_and_rebuild_only_mix() -> anyhow::Result<
         "{game} {mic} {voice}"
     );
     assert_eq!(gained.audio_tracks, source.audio_tracks);
+    let reopened = lib.get(&gained.id)?;
+    assert_eq!(reopened.mix_gain(AudioTrackKind::Mic), 0.0);
+    assert_eq!(reopened.mix_gain(AudioTrackKind::Voice), 0.5);
+    let mut reedit = req.clone();
+    reedit.source_id = reopened.id;
+    // Returning a muted source to unity must rebuild Mix, and preserve the
+    // other saved gains when only one track is specified.
+    reedit.track_gains = vec![TrackGain { kind: AudioTrackKind::Mic, gain: 1.0 }];
+    let restored = export(&lib, &reedit, &mut |_| (), &cancel)?;
+    assert_eq!(restored.mix_gain(AudioTrackKind::Mic), 1.0);
+    assert_eq!(restored.mix_gain(AudioTrackKind::Voice), 0.5);
+    let mix = decoded_audio(&lib.video_path(&restored), 0);
+    let game = tone_amplitude(&mix, 440.0);
+    assert!((tone_amplitude(&mix, 660.0) / game - 1.0).abs() < 0.1);
+    assert!((tone_amplitude(&mix, 880.0) / game - 0.5).abs() < 0.1);
+    reedit.source_id = restored.id.clone();
+    reedit.track_gains.clear();
+    let copied = export(&lib, &reedit, &mut |_| (), &cancel)?;
+    assert_eq!(copied.mix_gains, restored.mix_gains);
+    assert_eq!(decoded_audio(&lib.video_path(&copied), 0), decoded_audio(&lib.video_path(&restored), 0));
     req.precise = true;
     req.keep = vec![
         Segment {

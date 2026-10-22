@@ -107,7 +107,7 @@ These are offline A/B encodes of the supplied footage, not a second live game ru
   clips larger and higher fidelity than the old fps-independent table; see the
   complete stress-source rows instead of assuming universal size savings.
 - `KEYFRAME_INTERVAL_SECS=2` controls encoder GOP length and timestamp-driven
-  force-key-unit requests. `General::buffer_secs()` adds three seconds instead
+  force-key-unit requests. `Config::buffer_secs()` adds three seconds instead
   of two (one complete GOP plus one second of stream skew). Trimming remains
   bounded and starts at a keyframe. A test checks the longest requested clip
   at every phase of repeated two-second GOPs, including after trimming.

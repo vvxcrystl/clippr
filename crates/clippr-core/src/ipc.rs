@@ -12,7 +12,8 @@ use crate::config::Config;
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Status,
-    /// Save the last `seconds` of the buffer. `None` uses `clip_short_secs`.
+    /// Save the last `seconds` of the buffer. `None` uses the first clip binding,
+    /// or 30 seconds if none exist.
     Save { seconds: Option<u32> },
     GetConfig,
     /// Persist the config and apply it. Changing video settings restarts the capture pipeline,

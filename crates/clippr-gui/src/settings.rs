@@ -6,7 +6,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use adw::prelude::*;
-use clippr_core::config::{Codec, Config, EncoderPref, Quality, Resolution};
+use clippr_core::clip::AudioTrackKind;
+use clippr_core::config::{normalize_trigger, ClipBinding, Codec, Config, EncoderPref, Quality, Resolution};
 use clippr_core::ipc::{Request, Response};
 use gtk::{gio, glib};
 
@@ -70,11 +71,15 @@ impl Editor {
 
     fn apply(self: &Rc<Self>) {
         let new = self.pending.borrow().clone();
+        if let Err(e) = new.hotkeys.validate() {
+            self.toasts.add_toast(util::toast(&e.to_string()));
+            return;
+        }
         let old = self.state.config();
         if new == old {
             return;
         }
-        let restarts = self.state.online() && (new.video != old.video || new.audio != old.audio);
+        let restarts = self.state.online() && old.needs_capture_restart(&new);
         let this = self.clone();
         glib::spawn_future_local(async move {
             let toast = match this.state.apply_config(new).await {
@@ -105,34 +110,8 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay) -> gtk::Widget {
     // --- Clips ---------------------------------------------------------------------------
     let clips = adw::PreferencesGroup::builder()
         .title("Clips")
-        .description("How much each hotkey saves, and where clips go")
+        .description("Where clips go and save notifications")
         .build();
-
-    let short = adw::SpinRow::with_range(5.0, 600.0, 5.0);
-    short.set_title("Short clip");
-    short.set_subtitle("Seconds saved by the clip hotkey");
-    clips.add(&short);
-    {
-        let ed = ed.clone();
-        short.connect_value_notify(move |r| ed.edit(|c| c.general.clip_short_secs = r.value() as u32));
-    }
-    load(Box::new({
-        let r = short.clone();
-        move |c| r.set_value(c.general.clip_short_secs as f64)
-    }));
-
-    let long = adw::SpinRow::with_range(5.0, 600.0, 5.0);
-    long.set_title("Long clip");
-    long.set_subtitle("Seconds saved by the long clip hotkey");
-    clips.add(&long);
-    {
-        let ed = ed.clone();
-        long.connect_value_notify(move |r| ed.edit(|c| c.general.clip_long_secs = r.value() as u32));
-    }
-    load(Box::new({
-        let r = long.clone();
-        move |c| r.set_value(c.general.clip_long_secs as f64)
-    }));
 
     let folder = adw::ActionRow::builder().title("Save to").build();
     folder.add_css_class("property");
@@ -300,11 +279,11 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay) -> gtk::Widget {
                     None => state.status().map(|s| s.height).filter(|h| *h > 0).unwrap_or(1440),
                 };
                 let kbps = c.video_bitrate_kbps(height) as u64 + c.audio.bitrate_kbps as u64;
-                let bytes = kbps * 1000 / 8 * c.general.buffer_secs() as u64;
+                let bytes = kbps * 1000 / 8 * c.buffer_secs() as u64;
                 r.set_subtitle(&format!(
                     "About {} for {} s at {} kbps",
                     util::size(bytes),
-                    c.general.buffer_secs(),
+                    c.buffer_secs(),
                     kbps
                 ));
             }
@@ -405,6 +384,32 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay) -> gtk::Widget {
     }));
     page.add(&audio);
 
+    let levels = adw::PreferencesGroup::builder()
+        .title("Default levels")
+        .description("Each source's volume in the saved mix. Needs separate audio tracks. New recordings start with these levels. Saved clips keep their own levels")
+        .build();
+    type LevelField = fn(&mut Config) -> &mut u32;
+    let level_rows: [(AudioTrackKind, LevelField); 3] = [
+        (AudioTrackKind::Desktop, |c| &mut c.audio.levels.game),
+        (AudioTrackKind::Mic, |c| &mut c.audio.levels.mic),
+        (AudioTrackKind::Voice, |c| &mut c.audio.levels.voice),
+    ];
+    for (kind, field) in level_rows {
+        let scale = util::level_scale(100);
+        let row = adw::ActionRow::builder().title(kind.label()).build();
+        row.add_suffix(&scale);
+        levels.add(&row);
+        {
+            let ed = ed.clone();
+            scale.connect_value_changed(move |s| ed.edit(|c| *field(c) = s.value().round() as u32));
+        }
+        load(Box::new(move |c| {
+            scale.set_value(c.audio.levels.percent(kind) as f64);
+            row.set_sensitive(c.audio.separate_tracks);
+        }));
+    }
+    page.add(&levels);
+
     // --- Hotkeys -------------------------------------------------------------------------
     let keys = adw::PreferencesGroup::builder()
         .title("Hotkeys")
@@ -413,32 +418,82 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay) -> gtk::Widget {
              and on KDE you can rebind them in System Settings › Shortcuts.",
         )
         .build();
-    type HotkeyField = fn(&mut Config) -> &mut String;
-    let hotkey_rows: [(&str, HotkeyField); 3] = [
-        ("Save short clip", |c| &mut c.hotkeys.clip_short),
-        ("Save long clip", |c| &mut c.hotkeys.clip_long),
-        ("Toggle quick overlay", |c| &mut c.hotkeys.toggle_overlay),
-    ];
-    for (title, field) in hotkey_rows {
-        let row = adw::EntryRow::builder().title(title).show_apply_button(true).build();
-        keys.add(&row);
-        {
-            let ed = ed.clone();
-            row.connect_apply(move |r| {
-                let text = r.text().trim().to_uppercase();
-                if !text.is_empty() {
-                    ed.edit(|c| *field(c) = text);
-                }
-            });
-        }
-        load(Box::new({
-            let r = row.clone();
-            move |c| {
-                let mut c = c.clone();
-                r.set_text(field(&mut c));
+    let binding_rows = Rc::new(RefCell::new(Vec::<adw::ActionRow>::new()));
+    load(Box::new({
+        let keys = keys.clone();
+        let ed = ed.clone();
+        let rows = binding_rows.clone();
+        let previous = RefCell::new(None);
+        move |c| {
+            if previous.borrow().as_ref() == Some(&c.hotkeys.clips) {
+                return;
             }
-        }));
+            *previous.borrow_mut() = Some(c.hotkeys.clips.clone());
+            for row in rows.borrow_mut().drain(..) {
+                keys.remove(&row);
+            }
+            for binding in &c.hotkeys.clips {
+                let row = adw::ActionRow::builder()
+                    .title(&binding.trigger)
+                    .subtitle(format!("Save the last {}", util::clip_length(binding.seconds)))
+                    .build();
+                let edit = gtk::Button::builder()
+                    .icon_name("document-edit-symbolic")
+                    .tooltip_text("Edit shortcut")
+                    .valign(gtk::Align::Center)
+                    .build();
+                edit.add_css_class("flat");
+                let remove = gtk::Button::builder()
+                    .icon_name("user-trash-symbolic")
+                    .tooltip_text("Remove shortcut")
+                    .valign(gtk::Align::Center)
+                    .build();
+                remove.add_css_class("flat");
+                row.add_suffix(&edit);
+                row.add_suffix(&remove);
+                row.set_activatable_widget(Some(&edit));
+                {
+                    let ed = ed.clone();
+                    let trigger = binding.trigger.clone();
+                    edit.connect_clicked(move |button| {
+                        binding_dialog(&ed, button, Some(trigger.clone()));
+                    });
+                }
+                {
+                    let ed = ed.clone();
+                    let trigger = binding.trigger.clone();
+                    remove.connect_clicked(move |button| {
+                        ed.edit(|c| c.hotkeys.clips.retain(|b| b.trigger != trigger));
+                        button.set_sensitive(false);
+                        ed.apply();
+                    });
+                }
+                keys.add(&row);
+                rows.borrow_mut().push(row);
+            }
+        }
+    }));
+    let add = gtk::Button::builder().label("Add clip shortcut").build();
+    keys.set_header_suffix(Some(&add));
+    {
+        let ed = ed.clone();
+        add.connect_clicked(move |button| binding_dialog(&ed, button, None));
     }
+    let overlay_key = adw::EntryRow::builder()
+        .title("Toggle quick overlay")
+        .show_apply_button(true)
+        .build();
+    keys.add(&overlay_key);
+    {
+        let ed = ed.clone();
+        overlay_key.connect_apply(move |row| {
+            match normalize_trigger(&row.text()) {
+                Ok(trigger) => ed.edit(|c| c.hotkeys.toggle_overlay = trigger),
+                Err(e) => ed.toasts.add_toast(util::toast(&e.to_string())),
+            }
+        });
+    }
+    load(Box::new(move |c| overlay_key.set_text(&c.hotkeys.toggle_overlay)));
     page.add(&keys);
 
     // --- Recorder ------------------------------------------------------------------------
@@ -544,4 +599,80 @@ fn combo<'a>(title: &str, items: impl Iterator<Item = &'a str>) -> adw::ComboRow
 
 fn index_of<T: PartialEq + Copy>(table: &[(T, &str)], value: T) -> u32 {
     table.iter().position(|(v, _)| *v == value).unwrap_or(0) as u32
+}
+
+fn binding_dialog(ed: &Rc<Editor>, parent: &gtk::Button, original: Option<String>) {
+    let binding = ed.pending.borrow().hotkeys.clips.iter().find(|b| Some(&b.trigger) == original.as_ref()).cloned();
+    let dialog = adw::AlertDialog::builder()
+        .heading(if original.is_some() { "Edit clip shortcut" } else { "Add clip shortcut" })
+        .body("Choose a key and how much of the replay buffer it saves.")
+        .build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("save", "Save")]);
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("save"));
+    dialog.set_close_response("cancel");
+    let trigger = adw::EntryRow::builder().title("Shortcut, e.g. F9 or CTRL+F9").build();
+    trigger.set_text(binding.as_ref().map_or("", |b| b.trigger.as_str()));
+    let seconds = adw::SpinRow::with_range(1.0, 3600.0, 1.0);
+    seconds.set_title("Seconds to save");
+    seconds.set_subtitle("45 = 45 seconds, 300 = 5 minutes");
+    seconds.set_value(binding.as_ref().map_or(30, |b| b.seconds) as f64);
+    let fields = adw::PreferencesGroup::new();
+    fields.add(&trigger);
+    fields.add(&seconds);
+    let error = gtk::Label::builder().wrap(true).xalign(0.0).build();
+    error.add_css_class("error");
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.append(&fields);
+    content.append(&error);
+    dialog.set_extra_child(Some(&content));
+    let validate = Rc::new({
+        let ed = ed.clone();
+        let original = original.clone();
+        let dialog = dialog.downgrade();
+        let trigger = trigger.downgrade();
+        let seconds = seconds.downgrade();
+        move || {
+            let (Some(dialog), Some(trigger), Some(seconds)) = (dialog.upgrade(), trigger.upgrade(), seconds.upgrade()) else { return };
+            let result = normalize_trigger(&trigger.text()).and_then(|trigger| {
+                let mut hotkeys = ed.pending.borrow().hotkeys.clone();
+                let binding = ClipBinding { trigger, seconds: seconds.value() as u32 };
+                update_binding(&mut hotkeys, original.as_deref(), binding)?;
+                hotkeys.validate()
+            });
+            dialog.set_response_enabled("save", result.is_ok());
+            error.set_label(&result.err().map_or(String::new(), |e| e.to_string()));
+        }
+    });
+    validate();
+    {
+        let validate = validate.clone();
+        trigger.connect_changed(move |_| validate());
+    }
+    seconds.connect_value_notify(move |_| validate());
+    let ed = ed.clone();
+    let parent = parent.clone();
+    glib::spawn_future_local(async move {
+        if dialog.choose_future(Some(&parent)).await == "save" {
+            if let Ok(trigger) = normalize_trigger(&trigger.text()) {
+                let binding = ClipBinding { trigger, seconds: seconds.value() as u32 };
+                let mut hotkeys = ed.pending.borrow().hotkeys.clone();
+                match update_binding(&mut hotkeys, original.as_deref(), binding).and_then(|_| hotkeys.validate()) {
+                    Ok(()) => ed.edit(|c| c.hotkeys = hotkeys),
+                    Err(e) => ed.toasts.add_toast(util::toast(&e.to_string())),
+                }
+            }
+        }
+    });
+}
+
+fn update_binding(hotkeys: &mut clippr_core::config::Hotkeys, original: Option<&str>, binding: ClipBinding) -> anyhow::Result<()> {
+    if let Some(trigger) = original {
+        let existing = hotkeys.clips.iter_mut().find(|b| b.trigger == trigger)
+            .ok_or_else(|| anyhow::anyhow!("This shortcut was removed. Close this dialog and add a new one"))?;
+        *existing = binding;
+    } else {
+        hotkeys.clips.push(binding);
+    }
+    Ok(())
 }

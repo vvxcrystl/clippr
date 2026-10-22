@@ -159,6 +159,11 @@ impl ClipprTray {
         self.send(Message::Request(Box::new(Request::SetPaused { paused }), reply));
     }
 
+    fn save(&self, seconds: Option<u32>) {
+        let (reply, _) = oneshot::channel();
+        self.send(Message::Request(Box::new(Request::Save { seconds }), reply));
+    }
+
     fn state_line(&self) -> String {
         match &self.status {
             None => "Starting".into(),
@@ -218,18 +223,17 @@ impl ksni::Tray for ClipprTray {
         open_gui(&[]);
     }
 
-    /// Middle click saves a short clip, the same as the hotkey.
+    /// Middle click saves the default clip length.
     fn secondary_activate(&mut self, _x: i32, _y: i32) {
         if self.state() == CaptureState::Recording {
-            self.hotkey("clip-short");
+            self.save(None);
         }
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let recording = self.state() == CaptureState::Recording;
         let paused = self.state() == CaptureState::Paused;
-        let general = &self.config.general;
-        vec![
+        let mut items = vec![
             StandardItem {
                 label: self.state_line().replace('_', "__"),
                 enabled: false,
@@ -237,22 +241,18 @@ impl ksni::Tray for ClipprTray {
             }
             .into(),
             MenuItem::Separator,
-            StandardItem {
-                label: format!("Save last {}", clip_length(general.clip_short_secs)),
+        ];
+        for binding in &self.config.hotkeys.clips {
+            let seconds = binding.seconds;
+            items.push(StandardItem {
+                label: format!("Save last {}", clip_length(seconds)),
                 icon_name: "media-record".into(),
                 enabled: recording,
-                activate: Box::new(|t: &mut Self| t.hotkey("clip-short")),
+                activate: Box::new(move |t: &mut Self| t.save(Some(seconds))),
                 ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: format!("Save last {}", clip_length(general.clip_long_secs)),
-                icon_name: "media-record".into(),
-                enabled: recording,
-                activate: Box::new(|t: &mut Self| t.hotkey("clip-long")),
-                ..Default::default()
-            }
-            .into(),
+            }.into());
+        }
+        items.extend([
             MenuItem::Separator,
             StandardItem {
                 label: if paused { "Resume recording" } else { "Pause recording" }.into(),
@@ -295,7 +295,8 @@ impl ksni::Tray for ClipprTray {
                 ..Default::default()
             }
             .into(),
-        ]
+        ]);
+        items
     }
 
     fn watcher_offline(&self, _reason: ksni::OfflineReason) -> bool {

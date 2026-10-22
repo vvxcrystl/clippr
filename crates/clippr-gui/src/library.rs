@@ -205,14 +205,14 @@ pub fn build(
                 _ => "grid",
             });
             let cfg = state.config();
-            // Status page descriptions are markup, and hotkeys like "<Super>F8" contain '<'.
-            empty.set_description(Some(&glib::markup_escape_text(&format!(
-                "Press {} to save the last {}, or {} for the last {}",
-                cfg.hotkeys.clip_short,
-                util::clip_length(cfg.general.clip_short_secs),
-                cfg.hotkeys.clip_long,
-                util::clip_length(cfg.general.clip_long_secs),
-            ))));
+            let description = cfg.hotkeys.clips.iter().map(|binding| {
+                format!("{} for the last {}", binding.trigger, util::clip_length(binding.seconds))
+            }).collect::<Vec<_>>().join(", ");
+            empty.set_description(Some(&glib::markup_escape_text(&if description.is_empty() {
+                "Save a clip using the clip button, or add a shortcut in Settings".to_owned()
+            } else {
+                format!("Press {description}")
+            })));
             let bytes: u64 = (0..total)
                 .filter_map(|i| store.item(i).and_downcast::<glib::BoxedAnyObject>())
                 .map(|o| o.borrow::<ClipMeta>().size_bytes)
@@ -420,16 +420,16 @@ fn status_strip(state: &Rc<State>, toasts: &adw::ToastOverlay) -> gtk::Widget {
     detail.add_css_class("caption");
 
     let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    text.set_hexpand(true);
+    text.set_valign(gtk::Align::Center);
     text.append(&title);
     text.append(&detail);
 
     let pause = gtk::Button::builder().valign(gtk::Align::Center).build();
     pause.add_css_class("flat");
-    let clip_short = gtk::Button::builder().valign(gtk::Align::Center).build();
-    clip_short.add_css_class("suggested-action");
-    clip_short.add_css_class("pill-small");
-    let clip_long = gtk::Button::builder().valign(gtk::Align::Center).build();
-    clip_long.add_css_class("pill-small");
+    let clip_buttons = crate::clip_buttons::build(state, toasts, "pill-small");
+    clip_buttons.set_halign(gtk::Align::End);
+    clip_buttons.set_valign(gtk::Align::Center);
 
     let strip = gtk::Box::builder()
         .spacing(12)
@@ -442,16 +442,14 @@ fn status_strip(state: &Rc<State>, toasts: &adw::ToastOverlay) -> gtk::Widget {
     strip.append(&dot);
     strip.append(&text);
     strip.append(&pause);
-    strip.append(&clip_long);
-    strip.append(&clip_short);
+    strip.append(&clip_buttons);
 
     let refresh = {
         let state = state.clone();
         let (dot, title, detail) = (dot.clone(), title.clone(), detail.clone());
-        let (pause, clip_short, clip_long) = (pause.clone(), clip_short.clone(), clip_long.clone());
+        let pause = pause.clone();
         move || {
             let status = state.status();
-            let cfg = state.config();
             util::set_dot_state(&dot, util::state_class(status.as_ref()));
             title.set_label(util::state_label(status.as_ref()));
             detail.set_label(&match &status {
@@ -467,14 +465,7 @@ fn status_strip(state: &Rc<State>, toasts: &adw::ToastOverlay) -> gtk::Widget {
                 "media-playback-pause-symbolic"
             });
             pause.set_tooltip_text(Some(if paused { "Resume recording" } else { "Pause recording" }));
-            let recording = matches!(
-                status.as_ref().map(|s| s.state),
-                Some(clippr_core::ipc::CaptureState::Recording)
-            );
-            clip_short.set_label(&format!("Clip {}", util::clip_length(cfg.general.clip_short_secs)));
-            clip_long.set_label(&format!("Clip {}", util::clip_length(cfg.general.clip_long_secs)));
-            clip_short.set_sensitive(recording);
-            clip_long.set_sensitive(recording);
+
         }
     };
     refresh();
@@ -490,26 +481,6 @@ fn status_strip(state: &Rc<State>, toasts: &adw::ToastOverlay) -> gtk::Widget {
                 if let Err(e) = state.set_paused(!state.paused()).await {
                     toasts.add_toast(util::toast(&format!("{e}")));
                 }
-            });
-        });
-    }
-    for (button, long) in [(clip_short, false), (clip_long, true)] {
-        let state = state.clone();
-        let toasts = toasts.clone();
-        button.connect_clicked(move |button| {
-            let cfg = state.config();
-            let secs = if long { cfg.general.clip_long_secs } else { cfg.general.clip_short_secs };
-            let state = state.clone();
-            let toasts = toasts.clone();
-            let button = button.clone();
-            button.set_sensitive(false);
-            glib::spawn_future_local(async move {
-                let toast = match state.save_clip(Some(secs)).await {
-                    Ok(clip) => util::toast(&format!("Saved \u{201c}{}\u{201d}", clip.title)),
-                    Err(e) => util::toast(&format!("Couldn't save clip: {e}")),
-                };
-                toasts.add_toast(toast);
-                button.set_sensitive(true);
             });
         });
     }

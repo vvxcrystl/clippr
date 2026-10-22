@@ -279,12 +279,9 @@ mod tests {
     fn two_second_gops_keep_longest_clip_available_through_trimming() {
         gst::init().unwrap();
         let caps = gst::Caps::new_empty_simple("video/x-h264");
-        let general = clippr_core::config::General {
-            clip_short_secs: 3,
-            clip_long_secs: 5,
-            ..Default::default()
-        };
-        let mut ring = Ring::new(general.buffer_secs());
+        let mut config = clippr_core::config::Config::default();
+        config.hotkeys.clips[0].seconds = 5;
+        let mut ring = Ring::new(config.buffer_secs());
         for frame in 0..120 {
             ring.push(packet(frame, frame % 4 == 0), &caps, true);
             ring.push(packet(frame, true), &caps, false);
@@ -292,7 +289,7 @@ mod tests {
                 let snap = ring.snapshot(5).unwrap();
                 assert!(snap.video[0].keyframe);
                 assert!(snap.end - snap.start >= 5_000_000_000);
-                assert!(ring.duration() <= general.buffer_secs() as f32);
+                assert!(ring.duration() <= config.buffer_secs() as f32);
                 assert_eq!(
                     ring.bytes,
                     (ring.video.len() + ring.audio.iter().map(|a| a.packets.len()).sum::<usize>())

@@ -34,6 +34,15 @@ pub struct ClipMeta {
     /// Empty on legacy sidecars: interpret as a single Mix track when audio exists.
     #[serde(default)]
     pub audio_tracks: Vec<AudioTrack>,
+    /// Source gains used to build this clip's Mix. Empty legacy metadata means unity.
+    #[serde(default)]
+    pub mix_gains: Vec<crate::edit::TrackGain>,
+}
+
+impl ClipMeta {
+    pub fn mix_gain(&self, kind: AudioTrackKind) -> f32 {
+        self.mix_gains.iter().find(|g| g.kind == kind).map_or(1.0, |g| g.gain)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

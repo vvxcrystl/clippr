@@ -105,6 +105,11 @@ marked default), Game, optional Microphone, then Voice chat. Disable desktop cap
 to omit both Game and Voice; disable mic capture to omit Microphone. Disabling
 separate tracks retains the previous single mixed-track path.
 
+`[audio.levels]` sets each source's volume in the saved Mix, in percent, for example
+`game = 60` to keep game audio under the microphone. Source tracks stay as recorded, and
+each new clip stores the levels used for its Mix. The editor reads those saved levels,
+independent of current defaults. Levels have no effect without separate tracks.
+
 Game includes output streams playing to the default sink except voice applications.
 `voice_apps` matches application name, process binary and node name without case
 sensitivity, including full client identities for WebRTC streams. Defaults are

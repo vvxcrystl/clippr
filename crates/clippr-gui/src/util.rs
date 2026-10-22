@@ -128,6 +128,19 @@ pub fn app_icon(app: &AppInfo) -> Option<gio::Icon> {
         .map(|name| gio::ThemedIcon::new(&name).upcast())
 }
 
+/// Volume slider in percent, 0 to 150, with a mark at 100%.
+pub fn level_scale(percent: u32) -> gtk::Scale {
+    let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 150.0, 5.0);
+    scale.set_value(percent as f64);
+    scale.set_width_request(130);
+    scale.set_valign(gtk::Align::Center);
+    scale.add_mark(100.0, gtk::PositionType::Bottom, None);
+    scale.set_draw_value(true);
+    scale.set_value_pos(gtk::PositionType::Left);
+    scale.set_format_value_func(|_, v| format!("{v:.0}%"));
+    scale
+}
+
 /// A toast that shows `text` literally. `AdwToast` parses Pango markup by default, and clip
 /// titles can come from app-chosen window classes, so markup must never be interpreted.
 pub fn toast(text: &str) -> adw::Toast {

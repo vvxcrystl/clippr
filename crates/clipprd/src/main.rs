@@ -108,7 +108,7 @@ impl Daemon {
         self.recording_since = None;
         // New history prevents an aborted startup's callbacks touching a new generation.
         self.ring = Arc::new(Mutex::new(ring::Ring::new(
-            self.config.general.buffer_secs(),
+            self.config.buffer_secs(),
         )));
         // Encoded history can leave large freed arenas behind. Return those pages
         // once at teardown; never run allocator maintenance on the frame path.
@@ -226,7 +226,7 @@ impl Daemon {
     fn save(&mut self, seconds: Option<u32>, reply: Option<oneshot::Sender<Response>>) {
         let result = (|| {
             anyhow::ensure!(self.saves < 2, "two clips are already being saved");
-            let seconds = seconds.unwrap_or(self.config.general.clip_short_secs);
+            let seconds = seconds.unwrap_or(self.config.default_clip_secs());
             anyhow::ensure!(
                 seconds > 0 && seconds <= 3600,
                 "save length must be between 1 and 3600 seconds"
@@ -338,8 +338,7 @@ impl Daemon {
                 Request::SetConfig { config } => {
                     focus::validate_config(&config)?;
                     config.save()?;
-                    let restart =
-                        config.video != self.config.video || config.audio != self.config.audio;
+                    let restart = self.config.needs_capture_restart(&config);
                     let rebind = config.hotkeys != self.config.hotkeys;
                     self.config = config;
                     if restart {
@@ -349,7 +348,7 @@ impl Daemon {
                     } else {
                         let mut ring = lock(&self.ring);
                         ring.limit_ns =
-                            u64::from(self.config.general.buffer_secs()) * 1_000_000_000;
+                            u64::from(self.config.buffer_secs()) * 1_000_000_000;
                         ring.trim();
                     }
                     if rebind {
@@ -476,7 +475,7 @@ async fn main() -> Result<()> {
     };
     let mut daemon = Daemon {
         paused: !config.general.start_recording,
-        ring: Arc::new(Mutex::new(ring::Ring::new(config.general.buffer_secs()))),
+        ring: Arc::new(Mutex::new(ring::Ring::new(config.buffer_secs()))),
         config,
         capture: None,
         setup: None,
@@ -520,10 +519,12 @@ async fn main() -> Result<()> {
                     req => daemon.request(req, reply).await,
                 },
                 Message::Hotkey { id, activation_token } => match id.as_str() {
-                    "clip-short" => daemon.save(Some(daemon.config.general.clip_short_secs), None),
-                    "clip-long" => daemon.save(Some(daemon.config.general.clip_long_secs), None),
                     "toggle-overlay" => if let Err(e) = daemon.toggle_overlay(activation_token.as_deref()).await { warn!(error = %e, "overlay failed"); },
-                    _ => (),
+                    _ => {
+                        if let Some(seconds) = daemon.config.hotkeys.clip_seconds(&id) {
+                            daemon.save(Some(seconds), None);
+                        }
+                    },
                 },
                 Message::Saved(saved) => {
                     daemon.saved(*saved);

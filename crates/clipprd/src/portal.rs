@@ -105,14 +105,19 @@ pub async fn hotkeys(config: Config, tx: mpsc::Sender<Message>) -> Result<()> {
     let session = ManagedSession(std::sync::Arc::new(
         proxy.create_session(Default::default()).await?,
     ));
-    let shortcuts = [
-        NewShortcut::new("clip-short", "Save a short clip")
-            .preferred_trigger(config.hotkeys.clip_short.as_str()),
-        NewShortcut::new("clip-long", "Save a long clip")
-            .preferred_trigger(config.hotkeys.clip_long.as_str()),
+    let mut shortcuts = Vec::new();
+    for binding in &config.hotkeys.clips {
+        let trigger = clippr_core::config::normalize_trigger(&binding.trigger)?;
+        shortcuts.push(
+            NewShortcut::new(binding.shortcut_id(), format!("Save the last {} seconds", binding.seconds))
+                .preferred_trigger(trigger.as_str()),
+        );
+    }
+    let trigger = clippr_core::config::normalize_trigger(&config.hotkeys.toggle_overlay)?;
+    shortcuts.push(
         NewShortcut::new("toggle-overlay", "Toggle clippr overlay")
-            .preferred_trigger(config.hotkeys.toggle_overlay.as_str()),
-    ];
+            .preferred_trigger(trigger.as_str()),
+    );
     let session_path = serde_json::to_value(&*session)?
         .as_str()
         .context("invalid shortcut session path")?

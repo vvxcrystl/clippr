@@ -136,14 +136,15 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
     export_group.add(&kept_row);
     export_group.add(&precise_row);
 
-    // Per-source levels for the exported mix. Only clips recorded with separate tracks have
-    // sources to balance; the playback preview always plays the recorded mix.
+    // Start with the gains saved in this clip, independent of current recorder defaults.
+    // Only clips recorded with separate tracks have sources to balance; the playback preview
+    // always plays the recorded mix.
     let track_controls: Rc<Vec<TrackControl>> = Rc::new(
         clip.borrow()
             .audio_tracks
             .iter()
             .filter(|t| t.kind != AudioTrackKind::Mix)
-            .map(|t| TrackControl::new(t.kind, &t.label))
+            .map(|t| TrackControl::new(t.kind, &t.label, clip.borrow().mix_gain(t.kind)))
             .collect(),
     );
     let audio_group = adw::PreferencesGroup::builder()
@@ -719,19 +720,17 @@ pub fn build(state: &Rc<State>, toasts: &adw::ToastOverlay, clip: ClipMeta) -> a
         });
     }
 
-    // Free the decoder as soon as the page is closed.
+    // Navigation pages can still be mapped during their hiding transition.
+    // Stop playback immediately when navigating away, before GTK removes the page.
     {
-        let cancel_flag = cancel_flag.clone();
-        page.connect_hidden(move |page| {
-            if page.parent().is_none() || !page.is_mapped() {
-                media.set_playing(false);
-            }
-            let _ = &cancel_flag;
-        });
+        let media = media.clone();
+        page.connect_hiding(move |_| media.pause());
     }
     {
         let picture = picture.clone();
         page.connect_unrealize(move |_| {
+            media.pause();
+            media.clear();
             picture.set_paintable(None::<&gdk::Paintable>);
         });
     }
@@ -745,18 +744,13 @@ struct TrackControl {
     row: adw::ActionRow,
     scale: gtk::Scale,
     mute: gtk::ToggleButton,
+    /// The saved level, so opening a clip doesn't count as an edit.
+    initial: f32,
 }
 
 impl TrackControl {
-    fn new(kind: AudioTrackKind, label: &str) -> Self {
-        let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 150.0, 5.0);
-        scale.set_value(100.0);
-        scale.set_width_request(130);
-        scale.set_valign(gtk::Align::Center);
-        scale.add_mark(100.0, gtk::PositionType::Bottom, None);
-        scale.set_draw_value(true);
-        scale.set_value_pos(gtk::PositionType::Left);
-        scale.set_format_value_func(|_, v| format!("{v:.0}%"));
+    fn new(kind: AudioTrackKind, label: &str, gain: f32) -> Self {
+        let scale = util::level_scale((gain * 100.0).round() as u32);
         let mute = gtk::ToggleButton::builder()
             .icon_name("audio-volume-high-symbolic")
             .tooltip_text("Mute in the mix")
@@ -774,7 +768,7 @@ impl TrackControl {
         let row = adw::ActionRow::builder().title(label).title_lines(1).build();
         row.add_suffix(&scale);
         row.add_suffix(&mute);
-        Self { kind, row, scale, mute }
+        Self { kind, row, scale, mute, initial: gain }
     }
 
     /// Linear gain for the mix: 0 when muted, otherwise the slider as a fraction.
@@ -798,7 +792,7 @@ fn gains(controls: &[TrackControl]) -> Vec<TrackGain> {
 }
 
 fn gains_changed(controls: &[TrackControl]) -> bool {
-    controls.iter().any(|c| (c.gain() - 1.0).abs() > 0.001)
+    controls.iter().any(|c| (c.gain() - c.initial).abs() > 0.001)
 }
 
 fn pop(page: &adw::NavigationPage) {

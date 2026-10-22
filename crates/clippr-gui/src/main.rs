@@ -3,8 +3,11 @@
 //! Neither mode stays resident. The daemon launches `clippr-gui --overlay` on the overlay
 //! hotkey and terminates it on the next press.
 
+mod clip_buttons;
 mod daemon;
 mod editor;
+#[cfg(test)]
+mod gui_tests;
 mod library;
 mod overlay;
 mod settings;
